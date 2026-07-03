@@ -10,7 +10,9 @@
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
+use esp_hal::gpio::{Input, InputConfig};
 use esp_hal::timer::timg::TimerGroup;
+use esp_println::println;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -42,15 +44,21 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    let (mut _wifi_controller, _interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
-
     // TODO: Spawn some tasks
     let _ = spawner;
 
+    let pir = Input::new(peripherals.GPIO21, InputConfig::default());
+
+    let mut was_high = pir.is_high();
     loop {
-        Timer::after(Duration::from_secs(1)).await;
+        let is_high = pir.is_high();
+        if is_high && !was_high {
+            println!("motion detected");
+        } else if !is_high && was_high {
+            println!("motion stopped");
+        }
+        was_high = is_high;
+        Timer::after(Duration::from_millis(50)).await;
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
