@@ -10,9 +10,13 @@
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Input, InputConfig};
+use esp_hal::gpio::{Input, InputConfig, Level};
+use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
+use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
+use firmware::pir::{MotionEdge, MotionSensor};
+use firmware::ws2812::ws2812_frame;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -49,15 +53,37 @@ async fn main(spawner: Spawner) -> ! {
 
     let pir = Input::new(peripherals.GPIO21, InputConfig::default());
 
-    let mut was_high = pir.is_high();
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).unwrap();
+    let tx_config = TxChannelConfig::default()
+        .with_clk_divider(1)
+        .with_idle_output_level(Level::Low)
+        .with_idle_output(true)
+        .with_carrier_modulation(false)
+        .with_memsize(1);
+    let mut channel = rmt
+        .channel0
+        .configure_tx(&tx_config)
+        .unwrap()
+        .with_pin(peripherals.GPIO48);
+
+    let off = ws2812_frame(0, 0, 0);
+    channel = channel.transmit(&off).unwrap().wait().unwrap();
+
+    let mut motion = MotionSensor::new(pir.is_high());
     loop {
-        let is_high = pir.is_high();
-        if is_high && !was_high {
-            println!("motion detected");
-        } else if !is_high && was_high {
-            println!("motion stopped");
+        match motion.update(pir.is_high()) {
+            Some(MotionEdge::Detected) => {
+                println!("motion detected");
+                let red = ws2812_frame(8, 0, 0);
+                channel = channel.transmit(&red).unwrap().wait().unwrap();
+            }
+            Some(MotionEdge::Stopped) => {
+                println!("motion stopped");
+                let off = ws2812_frame(0, 0, 0);
+                channel = channel.transmit(&off).unwrap().wait().unwrap();
+            }
+            None => {}
         }
-        was_high = is_high;
         Timer::after(Duration::from_millis(50)).await;
     }
 
