@@ -10,11 +10,15 @@ version      = "0.1.0"
 name = "firmware"
 path = "./src/bin/main.rs"
 
+[[bin]]
+name = "camera_test"
+path = "./src/bin/camera_test.rs"
+
 [dependencies]
 shared = { path = "../shared" }
 
 esp-hal = { version = "~1.1.0", features = ["esp32s3", "unstable"] }
-esp-println = { version = "0.17.0", features = ["esp32s3"] }
+esp-println = { version = "0.17.0", default-features = false, features = ["esp32s3", "jtag-serial", "critical-section"] }
 
 esp-rtos = { version = "0.3.0", features = [
   "embassy",
