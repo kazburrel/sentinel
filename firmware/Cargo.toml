@@ -14,6 +14,22 @@ path = "./src/bin/main.rs"
 name = "camera_test"
 path = "./src/bin/camera_test.rs"
 
+[[bin]]
+name = "video_test"
+path = "./src/bin/video_test.rs"
+
+[[bin]]
+name = "mjpeg_test"
+path = "./src/bin/mjpeg_test.rs"
+
+[[bin]]
+name = "uxga_test"
+path = "./src/bin/uxga_test.rs"
+
+[[bin]]
+name = "uxga_video_test"
+path = "./src/bin/uxga_video_test.rs"
+
 [dependencies]
 shared = { path = "../shared" }
 

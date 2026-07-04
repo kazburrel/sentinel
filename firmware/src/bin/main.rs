@@ -16,6 +16,7 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use firmware::camera::CameraHandle;
+use firmware::ov3660::Framesize;
 use firmware::hexdump::print_hex_dump;
 use firmware::pir::{MotionEdge, MotionSensor};
 use firmware::ws2812::ws2812_frame;
@@ -78,6 +79,7 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO16, // D7
         peripherals.GPIO4,  // SDA
         peripherals.GPIO5,  // SCL
+        Framesize::Vga,
     )
     .await
     .unwrap();

@@ -1,34 +1,28 @@
-//! Thin hardware test for `firmware::camera::CameraHandle` -- verifies the
-//! reusable capture module works on real hardware before it gets wired up
-//! to PIR-triggered capture in the real `main.rs`. See `PROJECT_STATUS.md`
-//! (Milestone 4) for the full history of how this camera path was debugged.
-//!
-//! Wiring (Freenove ESP32-S3 CAM, confirmed working pin map):
-//! - SIOD  => GPIO4
-//! - SIOC  => GPIO5
-//! - XCLK  => GPIO15
-//! - VSYNC => GPIO6
-//! - HREF  => GPIO7
-//! - PCLK  => GPIO13
-//! - D0..D7 => GPIO11, GPIO9, GPIO8, GPIO10, GPIO12, GPIO18, GPIO17, GPIO16
+//! Same idea as `mjpeg_test.rs` (capture N frames back-to-back, hex-dump
+//! each one right after capture, reusing `CameraHandle`) but at UXGA
+//! (1600x1200) instead of VGA. Frame count is lower than `mjpeg_test.rs`'s
+//! 40 -- a UXGA frame is ~5x the bytes of a VGA frame, so hex-dumping it
+//! over 115200-baud serial takes proportionally longer per frame.
 
 #![no_std]
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use firmware::camera::CameraHandle;
-use firmware::ov3660::Framesize;
 use firmware::hexdump::print_hex_dump;
+use firmware::ov3660::Framesize;
 use static_cell::StaticCell;
 
 extern crate alloc;
 
-const JPEG_BUF_SIZE: usize = 64 * 1024;
+const JPEG_BUF_SIZE: usize = 256 * 1024;
 static JPEG_BUF: StaticCell<[u8; JPEG_BUF_SIZE]> = StaticCell::new();
+
+const FRAME_COUNT: u32 = 8;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -76,35 +70,57 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO16, // D7
         peripherals.GPIO4,  // SDA
         peripherals.GPIO5,  // SCL
-        Framesize::Vga,
+        Framesize::Uxga,
     )
     .await;
 
-    let frame_len = match camera {
-        Err(e) => {
+    let mut camera = match camera {
+        Ok(c) => c,
+        Err(e) => loop {
             println!("CameraHandle::new FAILED: {e:?}");
-            0
-        }
-        Ok(mut camera) => match camera.capture_jpeg(jpeg_buf).await {
-            Ok(len) => {
-                println!("capture_jpeg succeeded: {len} bytes");
-                len
-            }
-            Err(e) => {
-                println!("capture_jpeg FAILED: {e:?}");
-                0
-            }
+            Timer::after(Duration::from_secs(10)).await;
         },
     };
 
-    // Report/dump repeatedly forever, not once -- a one-shot print can be
-    // missed by the host's serial reader and looks identical to a hang.
+    println!("MJPEG CAPTURE START {FRAME_COUNT}");
+
+    let mut frame_count: u32 = 0;
+    let mut fail_count: u32 = 0;
+    let mut capture_time = Duration::from_ticks(0);
+
+    for _ in 0..FRAME_COUNT {
+        let t0 = Instant::now();
+        let result = camera.capture_jpeg_continuous(jpeg_buf).await;
+        capture_time += t0.elapsed();
+
+        match result {
+            Ok(len) => {
+                frame_count += 1;
+                print_hex_dump(&jpeg_buf[..len]);
+            }
+            Err(e) => {
+                fail_count += 1;
+                println!("frame FAILED: {e:?}");
+            }
+        }
+    }
+
+    let capture_secs = capture_time.as_millis() as f32 / 1000.0;
+    let camera_fps = if capture_secs > 0.0 {
+        frame_count as f32 / capture_secs
+    } else {
+        0.0
+    };
+
+    println!("MJPEG CAPTURE DONE frames={frame_count} failures={fail_count}");
+    println!("camera-only capture time: {capture_secs:.2}s, camera FPS: {camera_fps:.2}");
+
+    // Report repeatedly forever, not once -- a one-shot print can be missed
+    // by the host's serial reader and looks identical to a hang.
     loop {
         Timer::after(Duration::from_secs(10)).await;
-        if frame_len == 0 {
-            println!("still alive: capture failed, see error above");
-            continue;
-        }
-        print_hex_dump(&jpeg_buf[..frame_len]);
+        println!(
+            "still alive: frames={frame_count} failures={fail_count} camera_fps={camera_fps:.2}"
+        );
     }
 }

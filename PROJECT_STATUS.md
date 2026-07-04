@@ -239,19 +239,132 @@ real hardware:
   automatically. Typical round-trip is ~5-10s (PIR debounce + 2 skipped warm-up frames
   + serial transfer at 115200 baud), not the naive 20s fixed wait it started as.
 
+## Milestone 6 — continuous capture, MJPEG video assembly, UXGA resolution, 3x FPS fix
+
+Still within the camera phase (video, not yet WiFi/upload). Everything below is
+verified on real hardware, not yet committed to git.
+
+- **Continuous-capture benchmark** (`firmware/src/bin/video_test.rs`): reuses
+  `CameraHandle` in a tight loop for a fixed window, no hex-dumping during capture
+  (measured, not guessed: printing during a live capture starves the DMA — see
+  Milestone 4 Blocker #2b), reports frame count/size/failures/achieved FPS. First run:
+  58 frames in 10.42s (5.57 FPS), 1 failure, no resets — proved the reusable
+  `CameraHandle` design holds up under sustained repeated use, not just occasional PIR
+  triggers.
+- **MJPEG video assembly pipeline**: `firmware/src/bin/mjpeg_test.rs` captures N frames
+  back-to-back, hex-dumping each one immediately *after* it's captured (safe — no DMA
+  transfer is in-flight while dumping, unlike printing *during* one). Host-side,
+  `scripts/capture_video.sh` waits for the board's `MJPEG CAPTURE DONE` marker,
+  extracts frames via `scripts/decode_capture.py` (now always numbers frames
+  `_0.jpg`/`_1.jpg`/... , even a single frame, for a consistent ffmpeg input pattern),
+  then assembles them into a real video via `ffmpeg`.
+  - **First attempt produced an MJPEG-codec `.avi`** — the frames and assembled video
+    both had valid, non-black pixel data (confirmed by extracting raw pixels and
+    checking average brightness directly), but **macOS QuickTime Player has broken
+    support for MJPEG-in-AVI and silently renders it as a black frame.** Not a capture
+    bug — a playback-compatibility bug. Fixed by re-encoding to H.264 in an `.mp4`
+    container instead (`-c:v libx264 -pix_fmt yuv420p`), which plays natively
+    everywhere on macOS. The ESP32 still only ever produces raw JPEG frames; only the
+    final local-viewing container/codec changed.
+- **UXGA (1600×1200) resolution support**: added a `Framesize` enum to `ov3660.rs`
+  (`Vga` | `Uxga`) and a second hardcoded crop/scale/PLL register table,
+  `OV3660_FRAMESIZE_UXGA`, computed (not guessed) from the real driver's
+  `set_framesize()` algorithm and its `ratio_table[ASPECT_RATIO_4X3]` crop window —
+  same 4:3 aspect/crop window as VGA, but UXGA is more than half the sensor's native
+  2048×1536 so it runs *without* 2×2 binning (different `0x3820`/`0x3821`/`0x4514`/
+  `0x4520`/increment registers than VGA's binned path). Confirmed the PLL config is
+  unchanged from VGA's (only `FRAMESIZE_QXGA` or a 16MHz XCLK need a different PLL, and
+  neither applies at UXGA with our 20MHz XCLK) — so this reuses an already-verified PLL
+  setting rather than needing new, unverified clock math. `CameraHandle::new()` now
+  takes a `Framesize` argument; all existing call sites (`main.rs`, `camera_test.rs`,
+  `video_test.rs`, `mjpeg_test.rs`) pass `Framesize::Vga` to keep existing behavior
+  identical. New `firmware/src/bin/uxga_test.rs` (single-shot, 256KB buffer — a UXGA
+  JPEG is ~5x VGA's bytes) and `uxga_video_test.rs` (continuous burst, 8 frames)
+  verify it. First UXGA capture: 65,456 bytes, confirmed 1600×1200 valid JPEG.
+  **Not yet attempted: QXGA (2048×1536, the sensor's true native max)** — the real
+  driver uses a *different* PLL multiplier/divider specifically for `FRAMESIZE_QXGA`
+  (24/1/3/.../8 instead of VGA/UXGA's 30/1/3/.../10), which hasn't been ported or
+  tested yet. Deliberately stopped at UXGA as the lower-risk step since it reuses a
+  proven PLL config; QXGA would need its own verification pass.
+- **3x FPS fix for continuous capture**: `CameraHandle::capture_jpeg()` was
+  unconditionally skipping 2 "warm-up" frames on *every* call — correct for a cold,
+  infrequent PIR-triggered shot (sensor's auto-exposure/gain need to resettle after
+  sitting idle), but wasteful in a continuous back-to-back burst, where it was
+  discarding 2 out of every 3 frames captured for no reason. Fixed by splitting into
+  `capture_jpeg` (unchanged, still skips 2 — used by `main.rs`'s PIR path,
+  `camera_test.rs`, `uxga_test.rs`) and a new `capture_jpeg_continuous` (skips 0 — used
+  by `video_test.rs`, `mjpeg_test.rs`, `uxga_video_test.rs`), both delegating to a
+  shared private `capture_jpeg_with_warmup(buf, warmup_frames)`. **Measured effect:**
+  VGA continuous capture went from 6.56 FPS to 20.06 FPS; UXGA went from 3.50 FPS to
+  8.99 FPS — roughly the predicted 3x in both cases. `main.rs`'s PIR photo behavior is
+  completely unchanged (still uses the original `capture_jpeg`, still skips warm-up
+  every time, since a real motion event could be minutes after the last one).
+- User's own verdict on the resulting VGA video (20 FPS): noticeably smoother, no
+  longer feels like slideshow/fast-forward.
+
+## Image quality investigation (research done, no code changes yet)
+
+User asked to investigate every possible way to improve image sharpness/clarity before
+considering a different camera module, and explicitly asked to distinguish grounded
+claims from guesses. Investigated by reading the *entire* real `ov3660.c` (not just the
+framesize-relevant parts read earlier) — every ISP tuning function it exposes
+(`set_sharpness`, `set_denoise`, `set_contrast`, `set_saturation`, `set_brightness`,
+`set_ae_level`, `set_wb_mode`, `set_lenc`, `set_raw_gma`, `set_bpc`/`set_wpc`,
+`set_gainceiling`, `set_agc_gain`, `set_aec_value`) — cross-checked against what our own
+`OV3660_DEFAULT_REGS` table already enables by default. Findings, ranked:
+
+1. **Mechanical lens focus (highest potential impact, not a register)**: the real
+   driver explicitly has no autofocus support (`sensor->af_is_supported = NULL;` and
+   every other `af_*` hook `NULL`, comment `// No autofocus support`). This is
+   fixed-focus hardware — if the sample image is uniformly soft/defocused (not yet
+   provided/inspected), no register can fix that, only physically rotating the M12
+   lens barrel can.
+2. **Sharpness register** (`0x5300`-`0x530C`, `set_sharpness()`, level -3..+3): real
+   ISP edge-enhancement, genuinely untouched by us or by the stock defaults (sensor
+   runs its power-on "auto" sharpen mode). Cheap, safe, register-only, not yet tried.
+3. **JPEG quality**: `COMPRESSION_CTRL07` (`0x4407`) is 0-63, lower = higher quality.
+   We pass `10` — decent but not maxed; lowering to ~4-6 would reduce compression
+   artifacts further, more noticeably at higher resolutions.
+4. **Resolution** (UXGA/QXGA): more real pixels, but bounded by the lens's actual
+   resolving power — already built (UXGA) as of Milestone 6 above.
+5. Lens correction, gamma, bad-pixel-correction, white-pixel-correction (`0x5000`):
+   **already enabled by default** in our own port and in stock Espressif defaults —
+   no headroom left here, and this undercuts the idea that Freenove's default init
+   specifically trades quality for speed (Freenove doesn't maintain its own OV3660
+   driver; it uses this same reference driver).
+6. Denoise, manual exposure/gain, contrast/saturation/white-balance presets: real but
+   lower-impact/situational levers (denoise trades off against sharpness; manual
+   AE/AGC only helps in fixed known lighting, risky for a PIR camera across changing
+   conditions; contrast/saturation are cosmetic, not real detail).
+7. **Community/undocumented register tricks** (GitHub issues, forums, Reddit,
+   Discord): explicitly flagged as **not grounded** — no live access to those
+   discussions in this session, declined to fabricate specifics. This is the one piece
+   of the investigation suited to Codex rather than direct implementation.
+8. **OV5640 verdict**: likely still a noticeable upgrade even after fully optimizing
+   the OV3660 software-side, because the ceiling being optimized against is optical
+   (small fixed-focus lens), not the ISP — OV5640 modules commonly have real autofocus
+   and higher native resolution, addressing the root cause rather than working around
+   it. Try the free software levers first; they cost nothing.
+
+**Still waiting on**: an actual sample image from the user to inspect (not yet
+provided) before prioritizing which of the above to implement first.
+
 ## Next steps (not yet started)
 
-- **WiFi upload to the server.** This is the actual next project milestone per the
+- Act on the image-quality findings above once a sample image is available to diagnose
+  against: mechanical focus check, sharpness register, lower JPEG quality — all cheap,
+  safe, no code written yet pending user direction.
+- Optionally hand the community/undocumented-tricks research (point 7 above) to Codex.
+- **WiFi upload to the server.** The actual next major project milestone per the
   stated goal above — right now a captured JPEG only ever sits in RAM and gets
-  hex-dumped to serial for local debugging via `scripts/capture_photo.sh`. The real
-  pipeline needs: connect to WiFi (`esp-radio`/`embassy-net`, both already in
-  `Cargo.toml`), POST the captured JPEG bytes to the `server` crate (already scaffolded
-  in the workspace, not yet implemented), get a response back, decide what to do with
-  it (eventually: phone notification).
+  hex-dumped to serial for local debugging. The real pipeline needs: connect to WiFi
+  (`esp-radio`/`embassy-net`, both already in `Cargo.toml`), POST the captured JPEG
+  bytes to the `server` crate (already scaffolded in the workspace, not yet
+  implemented), get a response back, decide what to do with it (eventually: phone
+  notification).
 - `FOR_CODEX.md`'s original content (UPDATE 1-8) can likely be deleted entirely now —
   it documents a hang that was never real, and is superseded by this file.
-- This update (Milestone 5) is not yet committed to git — will be committed together
-  with this doc update.
+- Milestones 5 and 6 (everything above) are not yet committed to git.
 
 ## Current exact codebase state
 
@@ -259,14 +372,27 @@ real hardware:
 OV3660 camera capture proven working standalone via `camera_test.rs` (Milestone 4),
 workspace structure, `shared`/`server` scaffolding.
 
-**Uncommitted, current** (Milestone 5, described above — about to be committed):
-- `firmware/src/camera.rs` — refactored to the reusable `CameraHandle` struct
-- `firmware/src/bin/camera_test.rs` — updated to use `CameraHandle`
-- `firmware/src/bin/main.rs` — real PIR-triggered camera capture wired in
-- `firmware/src/lib.rs` — now also declares `pub mod hexdump;`
-- `firmware/src/hexdump.rs` — new shared serial hex-dump helper
-- `scripts/capture_photo.sh`, `scripts/decode_capture.py` — new local dev tooling for
-  triggering a capture and viewing the resulting photo
+**Uncommitted, current** (Milestones 5 and 6, described above):
+- `firmware/src/camera.rs` — `CameraHandle` struct, `capture_jpeg` +
+  `capture_jpeg_continuous` (shared `capture_jpeg_with_warmup` internal), `Framesize`
+  parameter on `new()`
+- `firmware/src/ov3660.rs` — `Framesize` enum, `OV3660_FRAMESIZE_UXGA` table,
+  `init_jpeg()` takes a `Framesize` argument
+- `firmware/src/bin/camera_test.rs` — uses `CameraHandle` + `Framesize::Vga`
+- `firmware/src/bin/main.rs` — real PIR-triggered camera capture wired in, unchanged
+  since Milestone 5, `Framesize::Vga`
+- `firmware/src/bin/video_test.rs` — new, continuous-capture FPS/stability benchmark
+- `firmware/src/bin/mjpeg_test.rs` — new, N-frame capture + hex-dump for video assembly
+- `firmware/src/bin/uxga_test.rs` — new, single-shot UXGA capture test
+- `firmware/src/bin/uxga_video_test.rs` — new, continuous UXGA burst capture
+- `firmware/src/lib.rs` — declares `pub mod hexdump;`
+- `firmware/src/hexdump.rs` — shared serial hex-dump helper
+- `firmware/Cargo.toml` — `[[bin]]` entries for all of the above
+- `scripts/capture_photo.sh`, `scripts/decode_capture.py` — local dev tooling for
+  triggering a single capture and viewing the resulting photo (`decode_capture.py` now
+  always numbers output frames, even a single one, for consistent ffmpeg input)
+- `scripts/capture_video.sh` — new, waits for a board-side MJPEG capture to finish,
+  assembles frames into a playable `.mp4` via ffmpeg
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
@@ -296,8 +422,13 @@ workspace structure, `shared`/`server` scaffolding.
 
 ## What's needed from Codex right now
 
-Nothing blocking — **Milestone 5 is complete** (reusable `CameraHandle`, real
-PIR-triggered capture in `main.rs`, verified repeatedly on hardware). The next
-milestone is WiFi + upload to the server (see "Next steps" above) — open to input on
-approach (e.g. `esp-radio`/`embassy-net` setup specifics, server request format) but
-nothing is currently blocked.
+Nothing blocking — **Milestones 5 and 6 are complete** (reusable `CameraHandle`,
+PIR-triggered capture in `main.rs`, continuous-capture MJPEG video pipeline, UXGA
+resolution, 3x FPS fix — all verified repeatedly on hardware). One optional,
+non-blocking research task if useful: trawling GitHub issues/forums/Reddit/Discord for
+OV3660-specific community-discovered register tweaks or undocumented tricks for image
+quality (see "Image quality investigation" above, point 7) — deliberately not
+fabricated here since there's no live access to those discussions in this session.
+Otherwise open to input on the next milestone, WiFi + upload to the server (see "Next
+steps" above), e.g. `esp-radio`/`embassy-net` setup specifics or server request format,
+but nothing is currently blocked.

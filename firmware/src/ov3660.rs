@@ -263,6 +263,54 @@ const OV3660_FRAMESIZE_VGA: &[(u16, u16)] = &[
     (0x0000, 0x00),
 ];
 
+/// Hardcoded UXGA (1600x1200) crop/scale/JPEG-compression-enable sequence.
+/// Computed from the same `ratio_table[ASPECT_RATIO_4X3]` crop window as
+/// VGA (`ov3660_settings.h`: `{2048,1536, 0,0, 2079,1547, 16,6, 2300,1564}`)
+/// via the real `set_framesize()` algorithm in `ov3660.c`, not guessed:
+/// UXGA is more than half the sensor's native 2048x1536, so unlike VGA it
+/// runs without 2x2 binning (`set_image_options()`'s no-binning branch:
+/// reg 0x3820=0x40, 0x3821=0x20, 0x4514=0x88, 0x4520=0xB0, no-binning
+/// odd-subsample increment 0x11 instead of VGA's 0x31), and uses the full,
+/// un-halved total/offset registers. PLL registers are unchanged from VGA
+/// (30x multiplier, /10 PCLK ratio) because that PLL config only changes
+/// for `FRAMESIZE_QXGA` or a 16MHz XCLK -- neither applies here.
+const OV3660_FRAMESIZE_UXGA: &[(u16, u16)] = &[
+    (0x3800, 0x00), (0x3801, 0x00),
+    (0x3802, 0x00), (0x3803, 0x00),
+    (0x3804, 0x08), (0x3805, 0x1F),
+    (0x3806, 0x06), (0x3807, 0x0B),
+    (0x3808, 0x06), (0x3809, 0x40),
+    (0x380A, 0x04), (0x380B, 0xB0),
+    (0x380C, 0x08), (0x380D, 0xFC),
+    (0x380E, 0x06), (0x380F, 0x1C),
+    (0x3810, 0x00), (0x3811, 0x10),
+    (0x3812, 0x00), (0x3813, 0x06),
+    (0x5001, 0xA3),
+    (0x3820, 0x40),
+    (0x3821, 0x20),
+    (0x4514, 0x88),
+    (0x4520, 0xB0),
+    (0x3814, 0x11),
+    (0x3815, 0x11),
+    (0x303A, 0x00),
+    (0x303B, 0x1E),
+    (0x303C, 0x11),
+    (0x303D, 0x30),
+    (0x3824, 0x0A),
+    (0x460C, 0x22),
+    (0x0000, 0x00),
+];
+
+/// Which crop/scale register table to apply during `init_jpeg`.
+#[derive(Debug, Clone, Copy)]
+pub enum Framesize {
+    /// 640x480.
+    Vga,
+    /// 1600x1200 -- full-resolution sensor readout (no 2x2 binning),
+    /// scaled by the ISP to 1600x1200 output.
+    Uxga,
+}
+
 #[derive(Debug)]
 pub enum CheckIdError {
     I2c(esp_hal::i2c::master::Error),
@@ -323,7 +371,11 @@ impl<'d> Ov3660<'d> {
     /// into JPEG output mode, then sets JPEG quality (registers taken
     /// directly from the reference `reset()`/`set_pixformat()`/
     /// `set_quality()` functions in ov3660.c).
-    pub async fn init_jpeg(&mut self, quality: u8) -> Result<(), esp_hal::i2c::master::Error> {
+    pub async fn init_jpeg(
+        &mut self,
+        quality: u8,
+        framesize: Framesize,
+    ) -> Result<(), esp_hal::i2c::master::Error> {
         self.write_reg(0x3008, 0x82)?; // software reset
         Timer::after(Duration::from_millis(100)).await;
 
@@ -335,7 +387,11 @@ impl<'d> Ov3660<'d> {
         // COMPRESSION_CTRL07 = 0x4407, Bit[5:0]: QS (quality scale)
         self.write_reg(0x4407, quality & 0x3F)?;
 
-        self.write_table(OV3660_FRAMESIZE_VGA).await?;
+        let framesize_regs = match framesize {
+            Framesize::Vga => OV3660_FRAMESIZE_VGA,
+            Framesize::Uxga => OV3660_FRAMESIZE_UXGA,
+        };
+        self.write_table(framesize_regs).await?;
 
         Ok(())
     }

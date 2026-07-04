@@ -1,16 +1,13 @@
-//! Thin hardware test for `firmware::camera::CameraHandle` -- verifies the
-//! reusable capture module works on real hardware before it gets wired up
-//! to PIR-triggered capture in the real `main.rs`. See `PROJECT_STATUS.md`
-//! (Milestone 4) for the full history of how this camera path was debugged.
+//! Thin hardware test for `firmware::camera::CameraHandle` at UXGA
+//! (1600x1200) instead of the usual VGA (640x480) -- the "highest
+//! resolution" step. Reuses the exact same PLL clock config as VGA (see
+//! `ov3660::OV3660_FRAMESIZE_UXGA`'s doc comment for why that's safe), so
+//! this is a lower-risk step up from VGA than the sensor's true maximum
+//! (QXGA, 2048x1536), which needs different, not-yet-verified PLL registers.
 //!
-//! Wiring (Freenove ESP32-S3 CAM, confirmed working pin map):
-//! - SIOD  => GPIO4
-//! - SIOC  => GPIO5
-//! - XCLK  => GPIO15
-//! - VSYNC => GPIO6
-//! - HREF  => GPIO7
-//! - PCLK  => GPIO13
-//! - D0..D7 => GPIO11, GPIO9, GPIO8, GPIO10, GPIO12, GPIO18, GPIO17, GPIO16
+//! Uses a 256KB buffer instead of camera_test.rs's 64KB -- a UXGA JPEG has
+//! ~6x the pixels of VGA, so the compressed size is expected to be
+//! considerably larger even at the same quality setting.
 
 #![no_std]
 #![no_main]
@@ -21,13 +18,13 @@ use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use firmware::camera::CameraHandle;
-use firmware::ov3660::Framesize;
 use firmware::hexdump::print_hex_dump;
+use firmware::ov3660::Framesize;
 use static_cell::StaticCell;
 
 extern crate alloc;
 
-const JPEG_BUF_SIZE: usize = 64 * 1024;
+const JPEG_BUF_SIZE: usize = 256 * 1024;
 static JPEG_BUF: StaticCell<[u8; JPEG_BUF_SIZE]> = StaticCell::new();
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -76,7 +73,7 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO16, // D7
         peripherals.GPIO4,  // SDA
         peripherals.GPIO5,  // SCL
-        Framesize::Vga,
+        Framesize::Uxga,
     )
     .await;
 

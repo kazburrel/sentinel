@@ -43,7 +43,7 @@ def main():
 
     written = []
     for i, data in enumerate(frames):
-        path = out_prefix if len(frames) == 1 else f"{out_prefix.rsplit('.', 1)[0]}_{i}.jpg"
+        path = f"{out_prefix.rsplit('.', 1)[0]}_{i}.jpg"
         with open(path, "wb") as f:
             f.write(data)
         written.append(path)

@@ -18,7 +18,7 @@ use esp_hal::{
     Blocking,
 };
 
-use crate::ov3660::Ov3660;
+use crate::ov3660::{Framesize, Ov3660};
 
 #[derive(Debug)]
 pub enum CameraError {
@@ -40,8 +40,8 @@ pub struct CameraHandle<'d> {
 impl<'d> CameraHandle<'d> {
     /// Configures the LCD-CAM/DMA peripheral and the OV3660 sensor over
     /// SCCB. Does the full sensor register init (soft reset, ~200 default
-    /// registers, JPEG format, VGA framesize/compression-enable) exactly
-    /// once -- `capture_jpeg` reuses this configured state.
+    /// registers, JPEG format, `framesize`'s crop/scale/compression-enable
+    /// registers) exactly once -- `capture_jpeg` reuses this configured state.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         lcd_cam_periph: LCD_CAM<'d>,
@@ -63,6 +63,7 @@ impl<'d> CameraHandle<'d> {
             + esp_hal::gpio::interconnect::PeripheralOutput<'d>,
         scl: impl esp_hal::gpio::interconnect::PeripheralInput<'d>
             + esp_hal::gpio::interconnect::PeripheralOutput<'d>,
+        framesize: Framesize,
     ) -> Result<Self, CameraError> {
         let cam_config = cam::Config::default().with_frequency(Rate::from_mhz(20));
         let lcd_cam = LcdCam::new(lcd_cam_periph);
@@ -101,7 +102,7 @@ impl<'d> CameraHandle<'d> {
             }
         }
 
-        sensor.init_jpeg(10).await.map_err(CameraError::I2c)?;
+        sensor.init_jpeg(10, framesize).await.map_err(CameraError::I2c)?;
 
         Ok(Self {
             camera: Some(camera),
@@ -115,10 +116,36 @@ impl<'d> CameraHandle<'d> {
     /// each call starts a fresh DMA receive on the already-configured sensor
     /// and hands the camera hardware back to `self` when done.
     ///
+    /// Skips 2 settling frames before keeping the real one, since the
+    /// sensor's auto-exposure/gain need a moment to adjust after sitting
+    /// idle -- correct for a cold/standalone shot (e.g. a PIR-triggered
+    /// photo, possibly minutes after the last one), but wasteful for a
+    /// continuous back-to-back burst; use `capture_jpeg_continuous` for that.
+    ///
     /// `jpeg_buf` must be large enough for one frame -- a real VGA JPEG at
     /// quality 10 has been measured at ~12-18KB on this hardware; a 64KB
     /// buffer leaves comfortable margin.
     pub async fn capture_jpeg(&mut self, jpeg_buf: &mut [u8]) -> Result<usize, CameraError> {
+        self.capture_jpeg_with_warmup(jpeg_buf, 2).await
+    }
+
+    /// Same as `capture_jpeg`, but without the settling-frame skip -- for
+    /// calling back-to-back in a tight loop (e.g. building a short video),
+    /// where the sensor's auto-exposure/gain are already settled from the
+    /// previous call and re-skipping every time would throw away 2 out of
+    /// every 3 frames captured for no reason.
+    pub async fn capture_jpeg_continuous(
+        &mut self,
+        jpeg_buf: &mut [u8],
+    ) -> Result<usize, CameraError> {
+        self.capture_jpeg_with_warmup(jpeg_buf, 0).await
+    }
+
+    async fn capture_jpeg_with_warmup(
+        &mut self,
+        jpeg_buf: &mut [u8],
+        warmup_frames: u32,
+    ) -> Result<usize, CameraError> {
         let camera = self.camera.take().expect("camera handle already in use");
         let dma_rx_buf = esp_hal::dma_rx_stream_buffer!(20 * 1000, 1000);
 
@@ -130,8 +157,9 @@ impl<'d> CameraHandle<'d> {
             }
         };
 
-        // Skip 2 partial/settling frames before treating the next one as real.
-        for _ in 0..2 {
+        // Skip `warmup_frames` partial/settling frames before treating the
+        // next one as real.
+        for _ in 0..warmup_frames {
             loop {
                 let (data, ends_with_eof) = transfer.peek_until_eof();
                 if data.is_empty() {
