@@ -30,6 +30,14 @@ path = "./src/bin/uxga_test.rs"
 name = "uxga_video_test"
 path = "./src/bin/uxga_video_test.rs"
 
+[[bin]]
+name = "psram_test"
+path = "./src/bin/psram_test.rs"
+
+[[bin]]
+name = "psram_record_test"
+path = "./src/bin/psram_record_test.rs"
+
 [dependencies]
 shared = { path = "../shared" }
 

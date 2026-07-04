@@ -242,7 +242,7 @@ real hardware:
 ## Milestone 6 — continuous capture, MJPEG video assembly, UXGA resolution, 3x FPS fix
 
 Still within the camera phase (video, not yet WiFi/upload). Everything below is
-verified on real hardware, not yet committed to git.
+verified on real hardware. Committed in `cafe716`.
 
 - **Continuous-capture benchmark** (`firmware/src/bin/video_test.rs`): reuses
   `CameraHandle` in a tight loop for a fixed window, no hex-dumping during capture
@@ -349,50 +349,116 @@ framesize-relevant parts read earlier) — every ISP tuning function it exposes
 **Still waiting on**: an actual sample image from the user to inspect (not yet
 provided) before prioritizing which of the above to implement first.
 
+## Milestone 7 — PSRAM-backed recording (record-then-export, not yet PIR-triggered)
+
+Codex research conclusion: PSRAM buffering is the right architecture for genuine
+motion-triggered recording (vs. the Milestone 6 approach of hex-dumping each frame to
+serial as it's captured, which only works for short test bursts, not a real "record for
+N seconds" product). Verified Codex's specific technical claims against the real
+`esp-hal 1.1.1`/`esp-alloc 0.10.0` source before writing any code:
+- `esp_hal::psram::{Psram, PsramConfig}` and `Psram::raw_parts() -> (*mut u8, usize)`
+  exist exactly as described.
+- `esp_alloc::psram_allocator!` macro exists, and its doc comment carries the *exact
+  same* atomic-safety warning Codex cited (`esp32-camera`/ESP32-S3: atomic instructions
+  don't work correctly on PSRAM-resident memory).
+- `esp_println::Printer::write_bytes(&[u8])` (raw binary write, not text formatting)
+  exists, confirming raw-binary export is possible over the same USB-Serial/JTAG path
+  already used for everything else.
+
+Design decision made from this: rather than routing the frame arena through
+`esp_alloc`'s global heap (which would mix internal/external memory in one allocator
+and require careful capability-tagging to avoid ever putting an atomic in PSRAM), get
+PSRAM's raw pointer+size directly via `raw_parts()` and manage a simple hand-rolled
+arena over it -- no `Vec`/`Box`/atomics involved at all, so the atomics-in-PSRAM hazard
+is avoided by construction, not by discipline.
+
+- **`firmware/src/bin/psram_test.rs`** (new): standalone PSRAM smoke test, no camera
+  code at all. Confirms `Psram::new()` reports ~8MB and that a byte pattern written
+  across the whole region reads back correctly. **Verified on hardware**: exactly
+  8,388,608 bytes (8.00MB) detected, 3/3 full-region pattern-check rounds passed, no
+  crashes -- run twice (reflash + rerun) with identical results both times.
+- **`firmware/src/recorder.rs`** (new): `PsramRecorder` -- appends length-prefixed
+  frames (`[frame_len: u32 LE][timestamp_ms: u32 LE][JPEG bytes]`) into a raw
+  `&'static mut [u8]` region (e.g. from `Psram::raw_parts()`). Deliberately holds no
+  atomics, just plain bytes, for the reason above. `reset()`/`frame_count()`/
+  `bytes_used()`/`capacity()`/`recorded_bytes()` round out the API.
+- **`firmware/src/bin/psram_record_test.rs`** (new): records a fixed 5-second burst of
+  VGA frames straight into PSRAM via `capture_jpeg_continuous` (Milestone 6's no-warmup
+  fast path) + `PsramRecorder::record_frame`, with **zero serial output at all during
+  recording** -- only after the window ends does it export the whole clip as one raw
+  binary dump (`Printer::write_bytes`, not hex) framed by `RAW EXPORT BEGIN <n>`/
+  `RAW EXPORT END` text markers. The DMA-adjacent scratch buffer stays in internal RAM
+  (a 64KB `StaticCell`, same as earlier tests) -- only the already-complete JPEG gets
+  copied into PSRAM, avoiding any PSRAM-DMA-alignment question entirely since it's a
+  plain CPU `copy_from_slice`, not a DMA transfer into PSRAM.
+- **`scripts/decode_raw_capture.py`** (new): parses the raw binary export (distinct
+  from `decode_capture.py`'s hex-text parser) and computes **FPS from real per-frame
+  timestamps** recorded on-device, not an estimate.
+- **`scripts/capture_psram_video.sh`** (new): waits for `RAW EXPORT END`, decodes,
+  assembles via `ffmpeg` into `.mp4`. Per explicit user request, individual frame files
+  now go into a `mktemp -d` temp directory that's deleted on exit (`trap cleanup EXIT`)
+  -- **only the final video is saved to the Desktop**, no more burst-photo clutter.
+  Applied the same fix to `scripts/capture_video.sh` (Milestone 6's pipeline) for
+  consistency.
+- **Verified on hardware, run twice**: 68 frames/4.9s (13.88 FPS measured), then 59
+  frames/4.95s (11.92 FPS measured) on a second run -- valid 640x480 H.264 `.mp4` both
+  times, Desktop left with only the two video files (confirmed via `ls`), no leftover
+  frame files anywhere (confirmed the temp dir gets cleaned up).
+- **Known tradeoff, not yet addressed**: this pipeline's measured FPS (~12-14) is
+  *lower* than Milestone 6's hex-dump-per-frame pipeline (20.06 FPS at VGA) -- the extra
+  per-frame `copy_from_slice` into PSRAM costs real time that the old approach (dump
+  straight from the scratch buffer) didn't pay. Not yet investigated whether this is
+  worth optimizing (e.g. capturing directly into PSRAM instead of scratch-then-copy)
+  or simply an acceptable cost for the architecture that actually supports real
+  multi-second recording without a tethered Mac mid-capture.
+- **Not yet done (this milestone stops here deliberately)**: recording is still
+  triggered by boot/reset, exactly like Milestone 6's test binaries -- it is **not**
+  wired to PIR motion yet. That was the last step of Codex's recommended sequence
+  ("only then connect this recorder to PIR motion") and hasn't been started.
+
 ## Next steps (not yet started)
 
-- Act on the image-quality findings above once a sample image is available to diagnose
-  against: mechanical focus check, sharpness register, lower JPEG quality — all cheap,
-  safe, no code written yet pending user direction.
-- Optionally hand the community/undocumented-tricks research (point 7 above) to Codex.
+- **Wire the PSRAM recorder to PIR motion** (Milestone 7's deliberately-deferred last
+  step): on motion detected, run the ~5-10s PSRAM-backed recording instead of (or in
+  addition to) the existing single-photo capture in `main.rs`; decide what happens to
+  the recorded clip afterward (export automatically? only on request? relates directly
+  to the still-pending WiFi/upload milestone below).
+- Optionally investigate the FPS gap noted in Milestone 7 (PSRAM copy overhead: ~12-14
+  FPS vs. Milestone 6's 20.06 FPS) if smoother recorded video is wanted.
+- Act on the image-quality findings from the investigation above once a sample image is
+  available to diagnose against: mechanical focus check, sharpness register, lower
+  JPEG quality — all cheap, safe, no code written yet pending user direction.
+- Optionally hand the community/undocumented-tricks research (image quality
+  investigation, point 7) to Codex.
 - **WiFi upload to the server.** The actual next major project milestone per the
-  stated goal above — right now a captured JPEG only ever sits in RAM and gets
-  hex-dumped to serial for local debugging. The real pipeline needs: connect to WiFi
-  (`esp-radio`/`embassy-net`, both already in `Cargo.toml`), POST the captured JPEG
-  bytes to the `server` crate (already scaffolded in the workspace, not yet
-  implemented), get a response back, decide what to do with it (eventually: phone
-  notification).
+  stated goal above — right now a captured JPEG/clip only ever sits in RAM/PSRAM and
+  gets dumped to serial for local debugging. The real pipeline needs: connect to WiFi
+  (`esp-radio`/`embassy-net`, both already in `Cargo.toml`), POST the captured bytes to
+  the `server` crate (already scaffolded in the workspace, not yet implemented), get a
+  response back, decide what to do with it (eventually: phone notification).
 - `FOR_CODEX.md`'s original content (UPDATE 1-8) can likely be deleted entirely now —
   it documents a hang that was never real, and is superseded by this file.
-- Milestones 5 and 6 (everything above) are not yet committed to git.
 
 ## Current exact codebase state
 
-**Committed to git** (through `499bb41`, Milestone 4): PIR + WS2812 (milestones 1-3),
-OV3660 camera capture proven working standalone via `camera_test.rs` (Milestone 4),
-workspace structure, `shared`/`server` scaffolding.
+**Committed to git** (through `cafe716`, Milestone 6): PIR + WS2812 (milestones 1-3),
+OV3660 camera capture (Milestone 4), reusable `CameraHandle` + PIR integration
+(Milestone 5), continuous capture/MJPEG video/UXGA/3x FPS fix (Milestone 6), workspace
+structure, `shared`/`server` scaffolding.
 
-**Uncommitted, current** (Milestones 5 and 6, described above):
-- `firmware/src/camera.rs` — `CameraHandle` struct, `capture_jpeg` +
-  `capture_jpeg_continuous` (shared `capture_jpeg_with_warmup` internal), `Framesize`
-  parameter on `new()`
-- `firmware/src/ov3660.rs` — `Framesize` enum, `OV3660_FRAMESIZE_UXGA` table,
-  `init_jpeg()` takes a `Framesize` argument
-- `firmware/src/bin/camera_test.rs` — uses `CameraHandle` + `Framesize::Vga`
-- `firmware/src/bin/main.rs` — real PIR-triggered camera capture wired in, unchanged
-  since Milestone 5, `Framesize::Vga`
-- `firmware/src/bin/video_test.rs` — new, continuous-capture FPS/stability benchmark
-- `firmware/src/bin/mjpeg_test.rs` — new, N-frame capture + hex-dump for video assembly
-- `firmware/src/bin/uxga_test.rs` — new, single-shot UXGA capture test
-- `firmware/src/bin/uxga_video_test.rs` — new, continuous UXGA burst capture
-- `firmware/src/lib.rs` — declares `pub mod hexdump;`
-- `firmware/src/hexdump.rs` — shared serial hex-dump helper
-- `firmware/Cargo.toml` — `[[bin]]` entries for all of the above
-- `scripts/capture_photo.sh`, `scripts/decode_capture.py` — local dev tooling for
-  triggering a single capture and viewing the resulting photo (`decode_capture.py` now
-  always numbers output frames, even a single one, for consistent ffmpeg input)
-- `scripts/capture_video.sh` — new, waits for a board-side MJPEG capture to finish,
-  assembles frames into a playable `.mp4` via ffmpeg
+**Uncommitted, current** (Milestone 7, described above):
+- `firmware/src/recorder.rs` — new, `PsramRecorder` (length-prefixed frame arena)
+- `firmware/src/bin/psram_test.rs` — new, standalone PSRAM init/pattern-check smoke test
+- `firmware/src/bin/psram_record_test.rs` — new, 5s VGA burst recorded into PSRAM,
+  raw binary export afterward
+- `firmware/src/lib.rs` — declares `pub mod recorder;`
+- `firmware/Cargo.toml` — `[[bin]]` entries for `psram_test`, `psram_record_test`
+- `scripts/decode_raw_capture.py` — new, parses the raw binary export format, computes
+  FPS from real per-frame timestamps
+- `scripts/capture_psram_video.sh` — new, waits for `RAW EXPORT END`, assembles a
+  `.mp4`, keeps individual frames in an auto-deleted temp dir
+- `scripts/capture_video.sh` — modified, same temp-dir-for-frames fix applied
+  retroactively (only the final video is saved to the Desktop, not each burst frame)
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
@@ -422,13 +488,17 @@ workspace structure, `shared`/`server` scaffolding.
 
 ## What's needed from Codex right now
 
-Nothing blocking — **Milestones 5 and 6 are complete** (reusable `CameraHandle`,
+Nothing blocking — **Milestones 5, 6, and 7 are complete** (reusable `CameraHandle`,
 PIR-triggered capture in `main.rs`, continuous-capture MJPEG video pipeline, UXGA
-resolution, 3x FPS fix — all verified repeatedly on hardware). One optional,
-non-blocking research task if useful: trawling GitHub issues/forums/Reddit/Discord for
-OV3660-specific community-discovered register tweaks or undocumented tricks for image
-quality (see "Image quality investigation" above, point 7) — deliberately not
-fabricated here since there's no live access to those discussions in this session.
-Otherwise open to input on the next milestone, WiFi + upload to the server (see "Next
-steps" above), e.g. `esp-radio`/`embassy-net` setup specifics or server request format,
-but nothing is currently blocked.
+resolution, 3x FPS fix, and now PSRAM-backed record-then-export — all verified
+repeatedly on hardware). Codex's PSRAM research was verified line-by-line against the
+real `esp-hal`/`esp-alloc` source before implementing and matched exactly, including
+the atomics-in-PSRAM warning. Two optional, non-blocking items if useful: (1) wiring
+the PSRAM recorder to PIR motion, the last step of Codex's original recommended
+sequence, not yet started; (2) trawling GitHub issues/forums/Reddit/Discord for
+OV3660-specific community register tweaks for image quality (see "Image quality
+investigation" above, point 7) — deliberately not fabricated here since there's no live
+access to those discussions in this session. Otherwise open to input on the next major
+milestone, WiFi + upload to the server (see "Next steps" above), e.g.
+`esp-radio`/`embassy-net` setup specifics or server request format, but nothing is
+currently blocked.

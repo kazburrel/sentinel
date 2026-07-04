@@ -27,10 +27,19 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$(mktemp -t capture_video).log"
+# Individual burst frames are throwaway intermediates -- keep them in a temp
+# dir (auto-cleaned below) instead of cluttering the Desktop. Only the final
+# assembled video is worth keeping.
+FRAME_DIR="$(mktemp -d -t capture_video_frames)"
 OUT_DIR="$HOME/Desktop"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-FRAME_PREFIX="$OUT_DIR/mjpeg_frames_$TIMESTAMP.jpg"
+FRAME_PREFIX="$FRAME_DIR/frame.jpg"
 VIDEO_OUT="$OUT_DIR/mjpeg_video_$TIMESTAMP.mp4"
+
+cleanup() {
+    rm -rf "$FRAME_DIR"
+}
+trap cleanup EXIT
 
 echo "listening on $PORT for up to ${MAX_WAIT}s -- reset/replug the board if it's not already running mjpeg_test..."
 
