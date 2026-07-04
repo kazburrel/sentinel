@@ -1,4 +1,4 @@
-//! Thin hardware test for `firmware::camera::capture_jpeg` -- verifies the
+//! Thin hardware test for `firmware::camera::CameraHandle` -- verifies the
 //! reusable capture module works on real hardware before it gets wired up
 //! to PIR-triggered capture in the real `main.rs`. See `PROJECT_STATUS.md`
 //! (Milestone 4) for the full history of how this camera path was debugged.
@@ -20,19 +20,14 @@ use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
-use firmware::camera::capture_jpeg;
+use firmware::camera::CameraHandle;
+use firmware::hexdump::print_hex_dump;
 use static_cell::StaticCell;
 
 extern crate alloc;
 
 const JPEG_BUF_SIZE: usize = 64 * 1024;
 static JPEG_BUF: StaticCell<[u8; JPEG_BUF_SIZE]> = StaticCell::new();
-
-/// Map a 4-bit value (0-15) to its lowercase ASCII hex digit.
-#[inline]
-fn hex_nibble(v: u8) -> u8 {
-    if v < 10 { b'0' + v } else { b'a' + (v - 10) }
-}
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -62,7 +57,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let jpeg_buf = JPEG_BUF.init_with(|| [0u8; JPEG_BUF_SIZE]);
 
-    let result = capture_jpeg(
+    let camera = CameraHandle::new(
         peripherals.LCD_CAM,
         peripherals.DMA_CH0,
         peripherals.I2C0,
@@ -80,19 +75,24 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO16, // D7
         peripherals.GPIO4,  // SDA
         peripherals.GPIO5,  // SCL
-        jpeg_buf,
     )
     .await;
 
-    let frame_len = match result {
-        Ok(len) => {
-            println!("capture_jpeg succeeded: {len} bytes");
-            len
-        }
+    let frame_len = match camera {
         Err(e) => {
-            println!("capture_jpeg FAILED: {e:?}");
+            println!("CameraHandle::new FAILED: {e:?}");
             0
         }
+        Ok(mut camera) => match camera.capture_jpeg(jpeg_buf).await {
+            Ok(len) => {
+                println!("capture_jpeg succeeded: {len} bytes");
+                len
+            }
+            Err(e) => {
+                println!("capture_jpeg FAILED: {e:?}");
+                0
+            }
+        },
     };
 
     // Report/dump repeatedly forever, not once -- a one-shot print can be
@@ -103,16 +103,6 @@ async fn main(spawner: Spawner) -> ! {
             println!("still alive: capture failed, see error above");
             continue;
         }
-        println!("JPEG BEGIN {frame_len}");
-        let mut line = [0u8; 128];
-        for chunk in jpeg_buf[..frame_len].chunks(64) {
-            for (i, &b) in chunk.iter().enumerate() {
-                line[i * 2] = hex_nibble(b >> 4);
-                line[i * 2 + 1] = hex_nibble(b & 0x0F);
-            }
-            let s = core::str::from_utf8(&line[..chunk.len() * 2]).unwrap_or("");
-            println!("{s}");
-        }
-        println!("JPEG END");
+        print_hex_dump(&jpeg_buf[..frame_len]);
     }
 }

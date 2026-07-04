@@ -15,8 +15,11 @@ use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
+use firmware::camera::CameraHandle;
+use firmware::hexdump::print_hex_dump;
 use firmware::pir::{MotionEdge, MotionSensor};
 use firmware::ws2812::ws2812_frame;
+use static_cell::StaticCell;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -24,6 +27,9 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 extern crate alloc;
+
+const JPEG_BUF_SIZE: usize = 64 * 1024;
+static JPEG_BUF: StaticCell<[u8; JPEG_BUF_SIZE]> = StaticCell::new();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -53,6 +59,29 @@ async fn main(spawner: Spawner) -> ! {
 
     let pir = Input::new(peripherals.GPIO21, InputConfig::default());
 
+    let jpeg_buf = JPEG_BUF.init_with(|| [0u8; JPEG_BUF_SIZE]);
+    let mut camera = CameraHandle::new(
+        peripherals.LCD_CAM,
+        peripherals.DMA_CH0,
+        peripherals.I2C0,
+        peripherals.GPIO15, // MCLK
+        peripherals.GPIO13, // PCLK
+        peripherals.GPIO6,  // VSYNC
+        peripherals.GPIO7,  // HREF
+        peripherals.GPIO11, // D0
+        peripherals.GPIO9,  // D1
+        peripherals.GPIO8,  // D2
+        peripherals.GPIO10, // D3
+        peripherals.GPIO12, // D4
+        peripherals.GPIO18, // D5
+        peripherals.GPIO17, // D6
+        peripherals.GPIO16, // D7
+        peripherals.GPIO4,  // SDA
+        peripherals.GPIO5,  // SCL
+    )
+    .await
+    .unwrap();
+
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).unwrap();
     let tx_config = TxChannelConfig::default()
         .with_clk_divider(1)
@@ -76,6 +105,14 @@ async fn main(spawner: Spawner) -> ! {
                 println!("motion detected");
                 let red = ws2812_frame(8, 0, 0);
                 channel = channel.transmit(&red).unwrap().wait().unwrap();
+
+                match camera.capture_jpeg(jpeg_buf).await {
+                    Ok(len) => {
+                        println!("photo captured: {len} bytes");
+                        print_hex_dump(&jpeg_buf[..len]);
+                    }
+                    Err(e) => println!("photo capture FAILED: {e:?}"),
+                }
             }
             Some(MotionEdge::Stopped) => {
                 println!("motion stopped");

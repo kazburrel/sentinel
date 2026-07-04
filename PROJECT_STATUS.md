@@ -196,49 +196,78 @@ VGA version) → buffered capture + dump to get real bytes off-device. Every one
 these was found and fixed with actual evidence (source code, real error messages,
 concrete byte counts), not guessing.
 
+## Milestone 5 — reusable CameraHandle + PIR integration + local capture tooling
+
+Everything listed as "next steps" in the previous update is now done and verified on
+real hardware:
+
+- **`firmware/src/camera.rs` refactored from a one-shot function into a stateful
+  `CameraHandle` struct.** The old `capture_jpeg()` function took ownership of all
+  camera peripherals *by value* and consumed them entirely within the call — meaning
+  it could only ever be called once per program lifetime, which is incompatible with
+  triggering a capture on every PIR motion event. Fixed by confirming (via
+  `esp-hal-1.1.1/src/lcd_cam/cam.rs`) that `CameraTransfer::stop()` returns
+  `(Camera<'d>, BUF::Final)` — i.e. hands the `Camera` back for reuse. `CameraHandle::new(...)`
+  now does the one-time peripheral wiring + full OV3660 SCCB init (soft reset, ~200
+  default registers, JPEG format, VGA framesize/compression-enable) exactly once;
+  `CameraHandle::capture_jpeg(&mut self, buf)` can be called repeatedly afterwards,
+  reusing the already-configured sensor and hardware each time (`camera: Option<Camera<'d>>`
+  internally, `.take()`'d out and put back after each `.receive()`/`.stop()` cycle).
+  This also means repeat captures are much faster than the first — no need to redo the
+  ~200-register SCCB init on every motion event.
+- **`firmware/src/bin/camera_test.rs`** updated to use `CameraHandle` (thin hardware
+  test, unchanged in spirit).
+- **`firmware/src/bin/main.rs` now does real PIR-triggered camera capture**: builds a
+  `CameraHandle` once at boot alongside the existing PIR/LED setup, and on
+  `MotionEdge::Detected` calls `camera.capture_jpeg(jpeg_buf)`, logging success (byte
+  count) or failure. `main.rs` contains zero camera protocol details — it only
+  orchestrates via the `CameraHandle` API, matching the existing `pir.rs`/`ws2812.rs`
+  separation-of-concerns pattern. GPIO usage doesn't conflict: PIR/LED use
+  GPIO21/GPIO48+RMT, camera uses LCD_CAM/DMA_CH0/I2C0 + GPIO4/5/6/7/8/9/10/11/12/13/15/16/17/18.
+- **Verified on real hardware repeatedly on a single boot** (no reflash between
+  triggers): 3 separate motion events each produced a fresh, valid photo (23171,
+  22407, 23524, 22463, 21349 bytes seen across test runs) — confirms the
+  `CameraHandle` reuse design actually works, not just compiles.
+- **New `firmware/src/hexdump.rs` module**: `print_hex_dump(&[u8])`, a small
+  serial-transport helper (hex-encode + `JPEG BEGIN`/`JPEG END` framing markers) shared
+  by both `main.rs` and `camera_test.rs` — kept separate from `camera.rs` since framing
+  bytes for serial debug output is a transport concern, not a camera concern.
+- **New `scripts/capture_photo.sh` + `scripts/decode_capture.py`**: a local dev/test
+  tool (not part of firmware) that listens to the board's serial port, waits for you to
+  trigger the PIR sensor, polls for a completed `JPEG END` marker (rather than always
+  sleeping a fixed window), decodes the hex dump into a real `.jpg`, and opens it
+  automatically. Typical round-trip is ~5-10s (PIR debounce + 2 skipped warm-up frames
+  + serial transfer at 115200 baud), not the naive 20s fixed wait it started as.
+
 ## Next steps (not yet started)
 
-- Clean up `firmware/src/bin/camera_test.rs` (currently a diagnostic binary with
-  verbose repeated dumping) into a proper reusable capture function/module, mirroring
-  how `pir.rs`/`ws2812.rs` were factored out after their own proof-of-concept stages.
-- Integrate camera capture into the real `firmware/src/bin/main.rs` (PIR-triggered,
-  not the standalone always-on-boot test it is now).
-- `arduino-camera-test/`, `capture.sh`, and `bisection-artifacts/` (the diagnostic-only
-  detour artifacts) have been deleted — no longer needed now that the Rust firmware
-  works on its own. `firmware/src/bin/camera_test.rs` is still around and still needs
-  the refactor/integration above.
+- **WiFi upload to the server.** This is the actual next project milestone per the
+  stated goal above — right now a captured JPEG only ever sits in RAM and gets
+  hex-dumped to serial for local debugging via `scripts/capture_photo.sh`. The real
+  pipeline needs: connect to WiFi (`esp-radio`/`embassy-net`, both already in
+  `Cargo.toml`), POST the captured JPEG bytes to the `server` crate (already scaffolded
+  in the workspace, not yet implemented), get a response back, decide what to do with
+  it (eventually: phone notification).
 - `FOR_CODEX.md`'s original content (UPDATE 1-8) can likely be deleted entirely now —
   it documents a hang that was never real, and is superseded by this file.
-- Nothing camera-related is committed to git yet — worth committing once the above
-  cleanup/integration decisions are made.
+- This update (Milestone 5) is not yet committed to git — will be committed together
+  with this doc update.
 
 ## Current exact codebase state
 
-**Committed to git** (still only through `305d75f`): milestone 1-3 firmware (PIR +
-WS2812), workspace structure, `shared`/`server` scaffolding. Nothing camera-related has
-been committed yet — all of the below is uncommitted working-tree state.
+**Committed to git** (through `499bb41`, Milestone 4): PIR + WS2812 (milestones 1-3),
+OV3660 camera capture proven working standalone via `camera_test.rs` (Milestone 4),
+workspace structure, `shared`/`server` scaffolding.
 
-**Uncommitted, current:**
-- `firmware/src/bin/main.rs` — back to the pure, unmodified milestone-3 PIR/LED
-  version (matches `305d75f` exactly; the camera diagnostic mess from earlier in this
-  saga has been fully reverted out of this file)
-- `firmware/src/bin/camera_test.rs` — **new, separate binary target** (added a second
-  `[[bin]]` entry in `Cargo.toml`), the OV3660 Rust port described above, **now fully
-  working end to end** (verified valid 640x480 JPEG capture)
-- `firmware/src/ov3660.rs` — new OV3660 driver module, described above
-- `firmware/src/lib.rs` — now also declares `pub mod ov3660;`
-- `firmware/Cargo.toml` — the experimental `esp32s3-cam-async` dependency has been
-  **removed** (no longer used at all); only stock `esp-hal` is used for camera work now
-- `FOR_CODEX.md` — the (now largely obsolete/resolved) hang-investigation log,
-  UPDATE 1-8. Kept for reference/history but its central conclusion (there's a real
-  hang somewhere) is now known to be wrong — see "Major discovery" above.
+**Uncommitted, current** (Milestone 5, described above — about to be committed):
+- `firmware/src/camera.rs` — refactored to the reusable `CameraHandle` struct
+- `firmware/src/bin/camera_test.rs` — updated to use `CameraHandle`
+- `firmware/src/bin/main.rs` — real PIR-triggered camera capture wired in
+- `firmware/src/lib.rs` — now also declares `pub mod hexdump;`
+- `firmware/src/hexdump.rs` — new shared serial hex-dump helper
+- `scripts/capture_photo.sh`, `scripts/decode_capture.py` — new local dev tooling for
+  triggering a capture and viewing the resulting photo
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
-- `arduino-camera-test/`, `capture.sh`, `bisection-artifacts/` — the Arduino/C++
-  diagnostic detour and old bisection investigation artifacts. **Deleted** — served
-  their purpose (proving the camera hardware worked, isolating the real bugs) and
-  aren't needed now that the Rust firmware works on its own. (`arduino-cli` + the
-  ESP32 Arduino core are still installed on this Mac as tooling, just not project
-  files — harmless to leave or remove independently.)
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
 
@@ -267,10 +296,8 @@ been committed yet — all of the below is uncommitted working-tree state.
 
 ## What's needed from Codex right now
 
-Nothing blocking — **Milestone 4 is complete.** One small fix already applied since
-the last update: `JPEG_BUF.init(...)` was changed to `JPEG_BUF.init_with(...)` to
-avoid constructing the 64KB array on the stack first (the same class of bug we hit
-earlier with `DMA_CHUNK`/`JPEG_OUT` in the experimental-crate attempt). See "Next
-steps" above for what's next (refactor into a reusable module, integrate with PIR,
-decide what to do with the diagnostic artifacts) — open to input on any of those, but
-none of them are blockers.
+Nothing blocking — **Milestone 5 is complete** (reusable `CameraHandle`, real
+PIR-triggered capture in `main.rs`, verified repeatedly on hardware). The next
+milestone is WiFi + upload to the server (see "Next steps" above) — open to input on
+approach (e.g. `esp-radio`/`embassy-net` setup specifics, server request format) but
+nothing is currently blocked.
