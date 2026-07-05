@@ -1155,20 +1155,156 @@ that logic living only in a standalone test binary.
 single-attempt path is proven reliable, which the above hardware test was the first
 real pass at) -- see Next steps. Battery work follows that.
 
+## Milestone 16 — reliability hardening: timeouts, degraded boot, reconnect, dedup, retries (verified on hardware)
+
+Milestone 15 was committed first (`d6cd733`), then a review found seven real reliability
+gaps in it -- all fixed, tested, and verified on real hardware (not just re-built):
+
+- **Bounded upload timeouts, fixed**: `upload_event()` had no timeout at all -- a
+  stalled server (accepting the connection, then never reading or never responding)
+  could leave it (and the whole motion event loop behind it) waiting forever. Added
+  `CONNECT_TIMEOUT` (5s) around the TCP connect and `TRANSFER_TIMEOUT` (20s) around the
+  whole send-then-read-response step, via `embassy_time::with_timeout`. A new
+  `UploadOutcome::TimedOut` variant reports this distinctly from a clean connection
+  refusal or a mid-transfer I/O error.
+- **Degraded startup, fixed**: boot used to block on `connect_async()` in a loop and
+  then on `stack.wait_config_up()` -- during a WiFi outage, the board would never reach
+  the PIR motion loop at all, meaning it couldn't even record locally. Replaced with a
+  new `wifi_maintain_task` background task (connects, waits for a disconnect, reconnects,
+  forever) spawned once and never awaited by `main()`; boot proceeds straight to camera/
+  PIR setup regardless of whether WiFi has connected yet.
+- **WiFi reconnection after a later disconnect, fixed**: the same `wifi_maintain_task`
+  handles this uniformly -- `WifiController::wait_for_disconnect_async()` blocks until a
+  real disconnect event, then the loop falls through to `connect_async()` again, exactly
+  like the initial connect. One task covers both "never connected yet" and "was
+  connected, then dropped."
+- **Empty-event upload, fixed**: if every single capture attempt in an event failed (PIR
+  fired but the camera never produced a frame), `main.rs` used to upload a zero-length
+  thumbnail and video anyway and get back a real `200`. Fixed at two layers: `main.rs`
+  now checks `recorder.frame_count() == 0` and skips the upload entirely (USB export
+  still runs, for completeness, showing 0 bytes); `shared` independently now rejects any
+  zero-length part (`EnvelopeError::EmptyPart`) regardless of which client sends one, so
+  the server doesn't have to trust firmware to check this itself.
+- **Safe retries + reboot-safe event identity + server-side dedup, added**: `main.rs`
+  now generates a per-boot random `boot_nonce` (`esp_hal::rng::Rng`) and combines it with
+  the recording counter for `event_id` (`(boot_nonce << 32) | recording_count`), so IDs
+  don't collide with a previous boot's counter values. A new
+  `upload_event_with_retries()` wraps `upload_event()` in a bounded loop
+  (`MAX_UPLOAD_ATTEMPTS = 3`, 3s fixed backoff), retrying `ConnectFailed`/`TimedOut`/
+  `IoError`/server `5xx` (transient) but not `4xx` (retrying an identical malformed
+  request won't help). The server gained a matching `EventDedup` (a bounded/FIFO ring of
+  recently seen `event_id`s) checked in `store_event_with_committer()` right after
+  parsing the envelope header: a duplicate `event_id` is treated as an already-successful
+  retry and returns `200` without writing anything a second time, which is what actually
+  makes retries safe against the "server stored it, but firmware's read timed out before
+  seeing the response" race. 2 new `server` unit tests cover the dedup logic directly
+  (detects repeats, evicts oldest past capacity) and end-to-end (`store_event` called
+  twice with the same `event_id` stores once).
+- **Real warm-up offset preserved, fixed**: the video/thumbnail parts' `timestamp_ms` was
+  hardcoded to `0` in `main.rs`, even though capturing the first frame (shared by both
+  parts) includes the camera's warm-up delay -- so the true offset from `event_start` is
+  never actually zero. Now measured (`part_timestamp_ms`, captured the moment the first
+  frame succeeds) and passed to both parts' headers; `video_duration_ms` is now
+  `event_duration_ms - part_timestamp_ms` (the video's own content span, not including
+  the warm-up gap before it started). This is what a future audio part would need to
+  line up against the video accurately.
+- **Stale doc comment, fixed**: `main.rs`'s module doc said "a further 2s tail" -- the
+  code has used `TAIL_DURATION = 5s` since Milestone 10; the doc comment just never got
+  updated then. Fixed, and the doc comment expanded to describe the background WiFi
+  supervisor and retry behavior added in this milestone.
+- `shared` now has 12 unit tests (up from 11), `server` has 14 (up from 12); all pass
+  (`cargo test -p shared -p server`, 26 total).
+- **Verified on real hardware**, including scenarios specifically exercising the new
+  behavior, not just re-confirming what Milestone 15 already proved:
+  - **Reconnect-after-disconnect**: temporarily added a one-shot test scaffold to
+    `wifi_maintain_task` (forces a real `disconnect_async()` 15s after first connecting,
+    reverted before this was committed) -- confirmed the board reconnected on its own and
+    a subsequent real motion event uploaded successfully afterward (`event_id` and a
+    nonzero `part_timestamp_ms=139` visible in the server log), proving the reconnect
+    path is exercised by a genuine live disconnect, not just at boot.
+  - **Degraded boot**: temporarily set a wrong WiFi password (in the gitignored
+    `wifi_credentials.rs`, reverted after), reflashed, and confirmed a real motion event
+    still recorded fully (49 frames) and ran USB export even though WiFi never connected
+    -- the serial log shows the retry loop's real behavior end-to-end: attempt 1
+    (`NoRoute`) -> retryable -> wait 3s -> attempt 2 (`NoRoute`) -> wait 3s -> attempt 3
+    (`NoRoute`) -> attempts exhausted -> `WiFi upload FAILED -- could not connect to
+    server`, while `wifi_maintain_task` kept independently retrying the real connection
+    in the background (visible: a genuine `FourWayHandshakeTimeout` from the wrong
+    password) without blocking any of it. The board rearmed and kept running normally
+    afterward. Credentials restored and the clean (non-scaffolded) firmware reflashed
+    before the rest of this testing.
+  - **Normal operation post-fix**: multiple real motion events with the clean firmware
+    uploaded successfully, with `timestamp_ms` now consistently nonzero and matching the
+    real measured warm-up gap (as low as ~116ms, as high as ~7.6s on one event where
+    several early capture attempts failed first -- an honest reflection of real
+    variability, not a bug).
+  - **Mid-retry-cycle recovery**: attempted to kill and restart the server precisely
+    within a single event's retry window to catch attempt 2 or 3 succeeding after
+    attempt 1 failed; live human-triggered motion timing wasn't precise enough to land
+    exactly in that window across several tries (the server was either still down for
+    all 3 attempts, matching the degraded-boot result above, or already back up before
+    attempt 1). This exact sub-scenario is therefore verified by combining the two
+    results that were each independently confirmed on hardware -- the retry loop's
+    mechanics (degraded-boot test) and a fresh upload succeeding once connectivity is
+    back (every other test here) -- rather than by one single test pinning down that
+    precise timing window.
+  - All test uploads and artifacts deleted afterward.
+- `cargo build`/`cargo clippy --bins` clean across the firmware workspace.
+
+### Critical fix: dedup was recording event_id before storage actually succeeded
+
+A review of Milestone 16 found the retry-safety mechanism it just added had a real
+data-loss bug of its own: `EventDedup` recorded `event_id` as seen immediately after
+parsing the envelope header -- *before* the parts were validated or anything was
+written to disk. Sequence that broke: (1) an attempt reaches the server, (2) envelope
+validation or storage fails (`400`/`500`), (3) but `event_id` is already marked seen,
+(4) firmware retries the same `event_id` per Milestone 16's design, (5) the server now
+treats it as an already-successful duplicate and returns `200` without storing
+anything -- the exact opposite of what retries were added for. A failed attempt was
+silently and permanently unretryable.
+
+- **Fixed**: split `EventDedup::check_and_record` into `is_duplicate` (read-only,
+  called early to skip redundant work for a genuine duplicate) and `record` (mutating,
+  now called only once `store_event_with_committer` has committed every part
+  successfully -- the last line before returning `Ok`). A request that fails
+  envelope/part validation or fails to store no longer burns its `event_id`.
+- **3 new tests** (`server` now has 17, up from 14): `store_event_allows_retry_after_a_
+  storage_failure` (fake committer fails every part, confirms `event_id` isn't marked
+  seen, then a real retry with the same ID stores correctly), `store_event_allows_retry_
+  after_invalid_payload_with_same_event_id` (a truncated part fails validation, confirms
+  `event_id` isn't marked seen, then a corrected body with the same ID stores
+  correctly), and `event_dedup_does_not_record_until_told_to` (checking `is_duplicate`
+  repeatedly never itself records anything).
+- **Verified the tests actually catch the bug**: temporarily reintroduced the old
+  behavior (recording immediately after the duplicate check, before validation/storage),
+  confirmed both new `store_event_allows_retry_after_*` tests fail against it, then
+  restored the fix and confirmed all 17 tests pass again.
+- **Known limitation, intentionally not fixed here**: `EventDedup` is in-memory only --
+  a server restart forgets every recorded `event_id`, so retry-dedup is not restart-safe
+  (a retry arriving right after a server restart would be stored a second time under a
+  new receipt timestamp, same as before Milestone 16 existed). This is explicitly
+  deferred to accompany the future persistent offline queue work (see Next steps), which
+  will need durable event identity on both sides anyway -- adding a partial persistence
+  layer just for dedup now would be thrown away/reworked once that lands.
+
 ## Next steps (not yet started)
 
 - **Audio part, optional, later.** `PartKind::Audio` already exists in the envelope
   (reserved, unused) -- add it only once there's an actual audio source to capture;
   the wire format and server storage path need no changes to support it when that
   happens.
-- **Upload retries / offline handling, now the immediate next step.** `main.rs`
-  (Milestone 15) proved a single-attempt WiFi upload works end-to-end on hardware,
-  including a real failed-server scenario, and USB export always preserves the
-  recording regardless -- but a failed upload today is simply lost from the server's
-  perspective (no retry, no local queue). Next: retry the same event (still in PSRAM/
-  the thumbnail buffer at that point) some bounded number of times, and/or a persistent
-  local queue (onboard microSD, see below) for when WiFi itself is down, not just the
-  server.
+- **Persistent offline queue, now the immediate next step.** Milestone 16 added bounded
+  in-memory retries (3 attempts, 3s backoff) and reboot-safe event IDs; a post-review fix
+  made the server's `EventDedup` actually safe to retry against (it no longer marks an
+  `event_id` seen until the event is fully committed). But an event that exhausts all 3
+  attempts (e.g. a server or WiFi outage lasting more than ~10-15s) is still simply lost
+  from the server's perspective once that event's thumbnail/video buffers get reused by
+  the next motion event -- USB export is still the only durable fallback. `EventDedup`
+  itself is also still in-memory only (a server restart forgets every recorded
+  `event_id`); the future persistent queue should bring durable event identity on both
+  sides together, rather than patching dedup persistence in on its own first. Next: a
+  persistent local queue (onboard microSD, see below) so an event surviving a longer
+  outage can be retried later instead of only right after recording.
 - Build out the `server` crate's request routing beyond the single `POST /upload`
   endpoint (structured per-part storage is now done, per Milestone 14) once there's an
   actual second concern to route to (e.g. an AI-processing trigger or a query endpoint).
@@ -1243,16 +1379,44 @@ described above):
   fault-injection tests pinning down exactly which part fails and which files get
   rolled back.
 
-**Uncommitted, current** (Milestone 15, described above):
-- `firmware/src/bin/main.rs` — WiFi connect/DHCP added at boot; new `UploadOutcome` enum
-  and `upload_event()` async function (builds the two-part envelope, sends it, parses
-  the response into `Success`/`Rejected(status_code)`/`ConnectFailed`/`IoError`); called
-  right after each real motion event finishes recording, logging a clear
-  success/failure line, with the pre-existing USB raw export still always running
-  afterward regardless of the WiFi outcome. `RECORDING_ENABLED` flipped from `false` to
-  `true`. Verified on real hardware across 4 real motion events including a real
-  failed-server scenario and automatic recovery once the server came back (see
-  Milestone 15 above for the full blow-by-blow).
+**Committed** (`d6cd733`, Milestone 15): WiFi connect/DHCP at boot; `UploadOutcome` enum
+and `upload_event()` (builds the two-part envelope, sends it, parses the response);
+called right after each real motion event finishes recording; USB raw export still
+always runs afterward regardless of the WiFi outcome; `RECORDING_ENABLED` flipped from
+`false` to `true`. Verified on real hardware across 4 real motion events including a
+real failed-server scenario and automatic recovery once the server came back.
+
+**Uncommitted, current** (Milestone 16, described above):
+- `shared/src/lib.rs` — new `EnvelopeError::EmptyPart(PartKind)`, enforced in
+  `PartsIter` (`len == 0` rejected). 12 `#[cfg(test)]` unit tests (up from 11).
+- `server/src/main.rs` — new `EventDedup` (bounded/FIFO ring of recently seen
+  `event_id`s), threaded through `store_event_with_committer` -> `store_event` ->
+  `process_request` -> `handle_connection` -> `main` (one instance per server run,
+  `EVENT_DEDUP_CAPACITY = 256`); a duplicate `event_id` short-circuits to `Ok(vec![])`
+  (200, nothing written twice) right after envelope-header parsing, before the parts
+  list is even built -- `is_duplicate` (read-only check) and `record` (only called after
+  every part is actually committed) are deliberately separate methods, not one
+  check-and-record, so a request that fails validation or storage never burns its
+  `event_id` (a post-review fix; see the dedup-timing subsection above). 17
+  `#[cfg(test)]` unit tests total (up from 12).
+- `firmware/src/bin/main.rs`:
+  - `CONNECT_TIMEOUT`/`TRANSFER_TIMEOUT` bound every upload attempt via
+    `embassy_time::with_timeout`; new `UploadOutcome::TimedOut`.
+  - `wifi_maintain_task` (new background task: connect, wait for disconnect, reconnect,
+    forever) replaces the old blocking connect-then-`wait_config_up` sequence in
+    `main()` -- boot no longer waits on WiFi at all.
+  - `upload_event_with_retries()` (new) wraps `upload_event()` in a bounded retry loop
+    (`MAX_UPLOAD_ATTEMPTS = 3`, `UPLOAD_RETRY_BACKOFF = 3s`), skipping retry for `4xx`
+    rejections via `UploadOutcome::is_retryable()`.
+  - `event_id` now `(boot_nonce << 32) | recording_count`, `boot_nonce` from
+    `esp_hal::rng::Rng` -- reboot-safe input to the server's new dedup.
+  - `recorder.frame_count() == 0` now skips the WiFi upload entirely (USB export still
+    runs) instead of sending empty parts.
+  - `part_timestamp_ms` (measured the moment the first frame actually succeeds, not
+    hardcoded `0`) passed to both the thumbnail and video part headers;
+    `video_duration_ms` now `event_duration_ms - part_timestamp_ms`.
+  - Module doc comment's stale "2s tail" corrected to "5s", and expanded to describe
+    the background WiFi supervisor and retry behavior.
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
@@ -1322,20 +1486,67 @@ intervention, confirming the single-attempt design recovers on its own. `main.rs
 way, since the project has moved from "developing near the board" into real
 reliability testing.
 
-**Immediate next step**: upload retries / offline handling, now that the single-attempt
-path has been proven reliable on real hardware (that reliability proof was the explicit
-gate for this work, per the user). The `500` vs `400` distinction, and the
-now-logged-but-not-yet-deduplicated `event_id`, are exactly what retry logic will need
-to key off. After that: battery work (explicitly follows the reliability work, per the
-user), and eventually a real container format for the video part so it doesn't need
+**Milestone 15 was committed (`d6cd733`), then a review of it found seven reliability
+gaps -- all fixed and verified on hardware (Milestone 16)**: no socket timeouts (fixed:
+`CONNECT_TIMEOUT`/`TRANSFER_TIMEOUT` via `embassy_time::with_timeout`), boot blocking
+forever on WiFi so the board couldn't record during an outage (fixed: a background
+`wifi_maintain_task` connects/reconnects independently of `main()`'s motion loop, which
+now proceeds immediately), WiFi reconnection after a later disconnect not being handled
+(fixed: the same task also covers this via `wait_for_disconnect_async`), an all-frames-
+failed event being able to upload empty parts and get a real `200` (fixed at both the
+`shared` wire-format level -- `EnvelopeError::EmptyPart` -- and in `main.rs`, which now
+skips the upload entirely when `frame_count() == 0`), retries needing a reboot-safe
+event identity and server-side deduplication to avoid duplicate files (fixed: a random
+per-boot nonce folded into `event_id`, plus a new server-side `EventDedup`, together
+making a real bounded retry loop -- `upload_event_with_retries`, 3 attempts, 3s backoff
+-- actually safe to add), the video part's `timestamp_ms` being hardcoded to `0` despite
+real warm-up latency before the first frame (fixed: measured and passed through, with
+`video_duration_ms` adjusted to match), and a stale "2s tail" doc comment (corrected to
+5s). `shared` now has 12 unit tests, `server` 14, all passing. Hardware verification
+specifically targeted the new behavior: a temporarily-scaffolded forced disconnect
+proved live reconnection (reverted before commit); a temporarily-wrong WiFi password
+proved degraded boot, the full 3-attempt retry cycle with correct backoff, and graceful
+final failure, all in one real event, with the board rearming and continuing normally
+afterward (credentials restored, clean firmware reflashed before further testing);
+multiple normal events confirmed real nonzero `timestamp_ms` values. The one
+sub-scenario not independently pinned down by a single live test -- a retry succeeding
+mid-cycle after an earlier attempt in the *same* call failed -- is covered by combining
+the degraded-boot test (proves the retry loop's mechanics) with every other successful
+test (proves a fresh attempt succeeds once connectivity is back), rather than by exact
+timing coordination with live human-triggered motion.
+
+**Critical fix on top of Milestone 16 (server-only, no hardware retest needed)**: a
+review found `EventDedup` recorded `event_id` as seen *before* validation/storage
+actually succeeded -- so a failed attempt (`400`/`500`) would permanently mark that
+`event_id` as already-stored, and firmware's own retry (same `event_id`, per Milestone
+16's design) would then get a `200` without anything actually being written. Fixed by
+splitting `check_and_record` into a read-only `is_duplicate` and a `record` called only
+after every part of an event is actually committed. 3 new tests (`server` now 17, up
+from 14) prove: a storage failure followed by a retry with the same ID stores
+correctly; an invalid payload followed by a corrected retry with the same ID stores
+correctly; and the fix's own tests were confirmed to actually catch the bug (temporarily
+reintroduced the old early-record behavior, watched the two new tests fail, restored the
+fix). This is a `server`-only change to code the firmware side already assumed worked
+correctly, so no wire format or firmware behavior changed -- no hardware reflash needed.
+`EventDedup` is still explicitly in-memory only (a server restart forgets recorded
+`event_id`s); that's flagged as an intentional, documented limitation to be addressed
+together with the future persistent offline queue, not patched in isolation now.
+
+**Immediate next step**: a persistent offline queue (onboard microSD) for outages
+longer than the bounded retry window now covers (~10-15s) -- Milestone 16's retries are
+still only in-memory for the lifetime of one event, and `EventDedup` doesn't survive a
+server restart either; both should get durable identity together when that lands. After
+that: battery work (explicitly follows the reliability work, per the user), and
+eventually a real container format for the video part so it doesn't need
 `decode_raw_capture.py`-style parsing to play. The longer-term deployment design is
 still a dedicated IoT network/VLAN that permits only the camera-to-server upload path
 plus TLS; the current shared home subnet + plaintext HTTP is a development setup, not
 the final security boundary -- but the receiver itself has now been through two rounds
-of security review plus a real-media integration pass and two rounds of its own
-post-review hardening, with automated regression coverage throughout, including
-fault-injection tests for the exact failure sequences that matter, and `main.rs` itself
-has now been proven end-to-end on hardware against a real server outage.
+of security review plus a real-media integration pass, two rounds of its own
+post-review hardening, a reliability pass with its own dedup/retry safety net, and a
+fix to that safety net's own correctness, with automated regression coverage
+throughout, and `main.rs` itself has now been proven end-to-end on hardware against a
+real server outage, a real WiFi outage, and a real live disconnect/reconnect.
 
 Also still open, lower priority: trawling GitHub issues/forums/Reddit/Discord for
 OV3660-specific community register tweaks for image quality (see "Image quality

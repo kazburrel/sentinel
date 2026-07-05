@@ -252,10 +252,61 @@ fn part_file_naming(kind: PartKind) -> (&'static str, &'static str) {
     }
 }
 
+/// Tracks recently seen event IDs so a retried upload (firmware resending
+/// the same event because it never got a confirmed response) doesn't get
+/// stored a second time under a new receipt timestamp -- firmware's only
+/// identity for an event is `event_id`, chosen once and reused across
+/// retries, so this is the only place that can catch the duplicate.
+///
+/// Deliberately bounded and FIFO, not a permanent log: this only needs to
+/// cover retries arriving within roughly the same server run (seconds to
+/// minutes apart), not the server's entire lifetime, so a fixed-size ring
+/// is enough -- no database, no persistence across restarts.
+struct EventDedup {
+    seen: std::collections::VecDeque<u64>,
+    capacity: usize,
+}
+
+impl EventDedup {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Returns `true` if `event_id` has already been successfully stored.
+    /// Read-only -- does *not* record anything, so a request that turns out
+    /// to be invalid or fails to store doesn't burn the ID for a later,
+    /// corrected retry. Call `record` only once the event has actually been
+    /// committed to disk.
+    fn is_duplicate(&self, event_id: u64) -> bool {
+        self.seen.contains(&event_id)
+    }
+
+    /// Records `event_id` as successfully stored. Must only be called after
+    /// the event is fully committed -- recording an ID that didn't actually
+    /// get stored (e.g. because parsing or storage failed) would make a
+    /// legitimate retry look like a duplicate and silently return `200`
+    /// without ever writing anything.
+    fn record(&mut self, event_id: u64) {
+        if self.seen.contains(&event_id) {
+            return;
+        }
+        if self.seen.len() >= self.capacity {
+            self.seen.pop_front();
+        }
+        self.seen.push_back(event_id);
+    }
+}
+
 /// Parses the `shared` crate's event envelope out of `body` and writes each
 /// part to its own file under `dir` via `committer`, all sharing one
 /// timestamp so parts from the same event sort together. Returns the stored
-/// filenames in part order, for logging.
+/// filenames in part order, for logging -- empty if `event_id` is a
+/// duplicate of one already seen by `dedup` (nothing new was written, but
+/// this is still success from the caller's perspective: the event is, in
+/// fact, already stored).
 ///
 /// The whole envelope is parsed -- and thus fully validated -- before
 /// anything is written to disk, so a malformed part N can never leave parts
@@ -276,9 +327,19 @@ fn part_file_naming(kind: PartKind) -> (&'static str, &'static str) {
 fn store_event_with_committer(
     dir: &str,
     body: &[u8],
+    dedup: &mut EventDedup,
     mut committer: impl FnMut(&str, u128, &str, &str, &[u8]) -> std::io::Result<String>,
 ) -> Result<Vec<String>, RequestError> {
     let (header, rest) = decode_envelope_header(body).map_err(RequestError::InvalidEnvelope)?;
+
+    if dedup.is_duplicate(header.event_id) {
+        println!(
+            "  event_id={} already stored -- treating as a retry, not writing again",
+            header.event_id
+        );
+        return Ok(Vec::new());
+    }
+
     let parts: Vec<(PartHeader, &[u8])> = PartsIter::new(rest, header.part_count)
         .collect::<Result<_, _>>()
         .map_err(RequestError::InvalidEnvelope)?;
@@ -311,16 +372,23 @@ fn store_event_with_committer(
             }
         }
     }
+
+    // Only recorded once every part is actually committed -- a request that
+    // fails validation or storage must not burn this event_id, or a later
+    // retry with the same ID (possibly corrected, possibly just luckier
+    // with disk space) would be wrongly treated as an already-stored
+    // duplicate and get a 200 without ever being written.
+    dedup.record(header.event_id);
     Ok(filenames)
 }
 
-fn store_event(dir: &str, body: &[u8]) -> Result<Vec<String>, RequestError> {
-    store_event_with_committer(dir, body, commit_part_file)
+fn store_event(dir: &str, body: &[u8], dedup: &mut EventDedup) -> Result<Vec<String>, RequestError> {
+    store_event_with_committer(dir, body, dedup, commit_part_file)
 }
 
 /// Does the actual request handling; the caller is responsible for turning
 /// an `Err` into the right HTTP error response on the same stream.
-fn process_request(stream: &mut TcpStream) -> Result<(), RequestError> {
+fn process_request(stream: &mut TcpStream, dedup: &mut EventDedup) -> Result<(), RequestError> {
     let peer = stream.peer_addr()?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     println!("connection from {peer}");
@@ -353,7 +421,7 @@ fn process_request(stream: &mut TcpStream) -> Result<(), RequestError> {
     let body = read_exact_body(stream, buf, headers_end, content_length)?;
     println!("body: {} bytes, validated complete", body.len());
 
-    let filenames = store_event(UPLOADS_DIR, &body)?;
+    let filenames = store_event(UPLOADS_DIR, &body, dedup)?;
     for filename in &filenames {
         println!("stored: {filename}");
     }
@@ -364,8 +432,8 @@ fn process_request(stream: &mut TcpStream) -> Result<(), RequestError> {
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    if let Err(e) = process_request(&mut stream) {
+fn handle_connection(mut stream: TcpStream, dedup: &mut EventDedup) {
+    if let Err(e) = process_request(&mut stream, dedup) {
         println!("request failed: {e:?}");
         let _ = stream.write_all(e.status_line().as_bytes());
         let _ = stream.write_all(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -478,7 +546,8 @@ mod tests {
         body.extend_from_slice(&thumbnail_part_header(jpeg.len() as u32));
         body.extend_from_slice(jpeg);
 
-        let filenames = store_event(&dir, &body).expect("valid single-thumbnail event should store");
+        let mut dedup = EventDedup::new(16);
+        let filenames = store_event(&dir, &body, &mut dedup).expect("valid single-thumbnail event should store");
         assert_eq!(filenames.len(), 1);
         assert!(filenames[0].ends_with(".jpg"), "got {:?}", filenames[0]);
         let stored = fs::read(&filenames[0]).expect("stored file should be readable");
@@ -495,6 +564,126 @@ mod tests {
     }
 
     #[test]
+    fn event_dedup_detects_repeats_and_evicts_oldest_past_capacity() {
+        let mut dedup = EventDedup::new(2);
+        assert!(!dedup.is_duplicate(1), "1 is new");
+        dedup.record(1);
+        assert!(!dedup.is_duplicate(2), "2 is new");
+        dedup.record(2);
+        assert!(dedup.is_duplicate(1), "1 was already recorded");
+        // Pushing a 3rd past capacity 2 evicts the oldest (1) -- documents
+        // the bounded/FIFO tradeoff: this only needs to catch retries close
+        // together in time, not the server's entire run.
+        assert!(!dedup.is_duplicate(3), "3 is new");
+        dedup.record(3);
+        assert!(!dedup.is_duplicate(1), "1 was evicted, looks new again");
+    }
+
+    #[test]
+    fn event_dedup_does_not_record_until_told_to() {
+        // Checking is_duplicate must never itself mark an ID as seen --
+        // only `record` does. This is the property the whole retry-safety
+        // fix depends on: a failed attempt must not burn the event_id.
+        let dedup = EventDedup::new(16);
+        assert!(!dedup.is_duplicate(1));
+        assert!(!dedup.is_duplicate(1), "repeated checks alone must not record");
+    }
+
+    #[test]
+    fn store_event_skips_storing_a_duplicate_event_id() {
+        let dir = scratch_dir("dedup");
+        let jpeg = b"fake-jpeg-bytes";
+        let mut body = Vec::new();
+        body.extend_from_slice(&shared::encode_envelope_header(1, 42));
+        body.extend_from_slice(&thumbnail_part_header(jpeg.len() as u32));
+        body.extend_from_slice(jpeg);
+
+        let mut dedup = EventDedup::new(16);
+        let first = store_event(&dir, &body, &mut dedup).expect("first upload of this event should store");
+        assert_eq!(first.len(), 1);
+
+        let second =
+            store_event(&dir, &body, &mut dedup).expect("retry of the same event_id should not error");
+        assert!(second.is_empty(), "retry should not create new files, got {second:?}");
+
+        let files: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+        assert_eq!(files.len(), 1, "expected exactly one file, found {files:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_event_allows_retry_after_a_storage_failure() {
+        // Regression test for the dedup-timing bug: recording event_id as
+        // seen *before* storage actually succeeds would make this retry
+        // wrongly look like an already-stored duplicate and silently
+        // return success without ever writing the file.
+        let dir = scratch_dir("retry_after_storage_failure");
+        let jpeg = b"fake-jpeg-bytes";
+        let mut body = Vec::new();
+        body.extend_from_slice(&shared::encode_envelope_header(1, 77));
+        body.extend_from_slice(&thumbnail_part_header(jpeg.len() as u32));
+        body.extend_from_slice(jpeg);
+
+        let mut dedup = EventDedup::new(16);
+
+        // First attempt: every part fails to commit (simulating a
+        // transient disk error) -- must fail, and must not mark event_id
+        // 77 as already stored.
+        let first = store_event_with_committer(&dir, &body, &mut dedup, |_, _, _, _, _| {
+            Err(std::io::Error::other("simulated transient storage failure"))
+        });
+        assert!(matches!(first, Err(RequestError::StorageFailure(_))));
+        assert!(!dedup.is_duplicate(77), "a failed attempt must not burn the event_id");
+
+        // Retry with the same event_id and the real committer -- must
+        // actually store this time, not be skipped as a duplicate.
+        let second = store_event(&dir, &body, &mut dedup).expect("retry after a storage failure should store");
+        assert_eq!(second.len(), 1, "retry should actually write the file this time");
+        assert!(second[0].ends_with(".jpg"));
+        assert_eq!(fs::read(&second[0]).unwrap(), jpeg);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_event_allows_retry_after_invalid_payload_with_same_event_id() {
+        // Same regression as above, but for a malformed *request* rather
+        // than a storage failure -- the envelope header (and thus
+        // event_id) parses fine, but the declared part length doesn't
+        // match what's actually present.
+        let dir = scratch_dir("retry_after_invalid_payload");
+        let jpeg = b"fake-jpeg-bytes";
+
+        let mut bad_body = Vec::new();
+        bad_body.extend_from_slice(&shared::encode_envelope_header(1, 88));
+        bad_body.extend_from_slice(&thumbnail_part_header(100)); // claims 100 bytes
+        bad_body.extend_from_slice(b"only 5"); // far fewer actually present
+
+        let mut dedup = EventDedup::new(16);
+        let first = store_event(&dir, &bad_body, &mut dedup);
+        assert!(matches!(
+            first,
+            Err(RequestError::InvalidEnvelope(EnvelopeError::PartLengthExceedsBuffer))
+        ));
+        assert!(!dedup.is_duplicate(88), "an invalid request must not burn the event_id");
+
+        // Retry with the same event_id and a corrected, well-formed body --
+        // must actually store.
+        let mut good_body = Vec::new();
+        good_body.extend_from_slice(&shared::encode_envelope_header(1, 88));
+        good_body.extend_from_slice(&thumbnail_part_header(jpeg.len() as u32));
+        good_body.extend_from_slice(jpeg);
+
+        let second = store_event(&dir, &good_body, &mut dedup)
+            .expect("retry with a corrected payload and the same event_id should store");
+        assert_eq!(second.len(), 1);
+        assert_eq!(fs::read(&second[0]).unwrap(), jpeg);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn store_event_writes_one_file_per_part() {
         let dir = scratch_dir("multipart");
         let thumb = b"thumb-bytes";
@@ -506,7 +695,8 @@ mod tests {
         body.extend_from_slice(&video_part_header(video.len() as u32));
         body.extend_from_slice(video);
 
-        let filenames = store_event(&dir, &body).expect("valid two-part event should store");
+        let mut dedup = EventDedup::new(16);
+        let filenames = store_event(&dir, &body, &mut dedup).expect("valid two-part event should store");
         assert_eq!(filenames.len(), 2);
         assert!(filenames[0].ends_with("_thumbnail.jpg"), "got {:?}", filenames[0]);
         assert!(filenames[1].ends_with("_video.bin"), "got {:?}", filenames[1]);
@@ -519,7 +709,8 @@ mod tests {
     #[test]
     fn store_event_rejects_malformed_envelope() {
         let dir = scratch_dir("malformed");
-        let err = store_event(&dir, b"not an envelope").expect_err("garbage body should be rejected");
+        let mut dedup = EventDedup::new(16);
+        let err = store_event(&dir, b"not an envelope", &mut dedup).expect_err("garbage body should be rejected");
         assert!(matches!(
             err,
             RequestError::InvalidEnvelope(EnvelopeError::BadMagic)
@@ -531,7 +722,8 @@ mod tests {
     fn store_event_rejects_zero_part_envelope() {
         let dir = scratch_dir("zero_parts");
         let body = shared::encode_envelope_header(0, 1);
-        let err = store_event(&dir, &body).expect_err("zero-part envelope should be rejected");
+        let mut dedup = EventDedup::new(16);
+        let err = store_event(&dir, &body, &mut dedup).expect_err("zero-part envelope should be rejected");
         assert!(matches!(
             err,
             RequestError::InvalidEnvelope(EnvelopeError::EmptyEvent)
@@ -549,7 +741,8 @@ mod tests {
         body.extend_from_slice(jpeg);
         body.extend_from_slice(b"trailing-junk-not-declared-by-part-count");
 
-        let err = store_event(&dir, &body).expect_err("trailing bytes should be rejected");
+        let mut dedup = EventDedup::new(16);
+        let err = store_event(&dir, &body, &mut dedup).expect_err("trailing bytes should be rejected");
         assert!(matches!(
             err,
             RequestError::InvalidEnvelope(EnvelopeError::TrailingBytes)
@@ -571,7 +764,8 @@ mod tests {
         body.extend_from_slice(&video_part_header(video.len() as u32));
         body.extend_from_slice(video);
 
-        let err = store_event_with_committer(&dir, &body, |_, _, _, _, _| {
+        let mut dedup = EventDedup::new(16);
+        let err = store_event_with_committer(&dir, &body, &mut dedup, |_, _, _, _, _| {
             Err(std::io::Error::other("simulated failure on first part"))
         })
         .expect_err("first part failing to commit should fail the whole event");
@@ -595,7 +789,8 @@ mod tests {
         body.extend_from_slice(video);
 
         let mut call_count = 0u32;
-        let err = store_event_with_committer(&dir, &body, |dir, ts, label, ext, payload| {
+        let mut dedup = EventDedup::new(16);
+        let err = store_event_with_committer(&dir, &body, &mut dedup, |dir, ts, label, ext, payload| {
             call_count += 1;
             if call_count == 1 {
                 // Let the first part (thumbnail) really commit, so there is
@@ -646,7 +841,8 @@ mod tests {
         readonly.set_mode(0o500); // r-x------, no write
         fs::set_permissions(&dir, readonly).unwrap();
 
-        let result = store_event(&dir, &body);
+        let mut dedup = EventDedup::new(16);
+        let result = store_event(&dir, &body, &mut dedup);
 
         // Restore permissions before asserting/cleaning up, so the test
         // doesn't leave an unremovable directory behind on failure.
@@ -661,13 +857,19 @@ mod tests {
     }
 }
 
+/// How many recent event IDs to remember for retry deduplication -- covers
+/// any realistic burst of retries for recent events without growing
+/// unbounded; see `EventDedup`.
+const EVENT_DEDUP_CAPACITY: usize = 256;
+
 fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", PORT))?;
     println!("listening on 0.0.0.0:{PORT} (trusted-LAN dev receiver only, see PROJECT_STATUS.md)");
 
+    let mut dedup = EventDedup::new(EVENT_DEDUP_CAPACITY);
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_connection(stream),
+            Ok(stream) => handle_connection(stream, &mut dedup),
             Err(e) => println!("accept error: {e}"),
         }
     }

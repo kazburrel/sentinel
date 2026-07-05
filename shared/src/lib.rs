@@ -115,6 +115,12 @@ pub enum EnvelopeError {
     /// `Pcm16Mono`) -- rejected rather than stored and trusted by whatever
     /// reads `encoding` downstream to pick a decoder.
     InvalidEncodingForKind { kind: PartKind, encoding: Encoding },
+    /// A part declaring zero payload bytes is never valid -- a thumbnail,
+    /// video, or (later) audio part with nothing in it is a capture failure,
+    /// not a real event; callers should skip the upload entirely rather than
+    /// send one (and the server rejects it defensively either way, since it
+    /// shouldn't have to trust every client to check this itself).
+    EmptyPart(PartKind),
     PartLengthExceedsBuffer,
     /// Bytes remained in the body after all declared parts were consumed --
     /// parsing must account for every byte, not just the parts it expected.
@@ -263,6 +269,9 @@ impl<'a> Iterator for PartsIter<'a> {
         let timestamp_ms = u32::from_le_bytes(self.remaining[2..6].try_into().unwrap());
         let duration_ms = u32::from_le_bytes(self.remaining[6..10].try_into().unwrap());
         let len = u32::from_le_bytes(self.remaining[10..14].try_into().unwrap());
+        if len == 0 {
+            return Some(Err(EnvelopeError::EmptyPart(kind)));
+        }
 
         let after_header = &self.remaining[PART_HEADER_LEN..];
         if after_header.len() < len as usize {
@@ -498,5 +507,20 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect_err("truncated part should be rejected");
         assert_eq!(err, EnvelopeError::PartLengthExceedsBuffer);
+    }
+
+    #[test]
+    fn rejects_zero_length_part() {
+        // A capture failure (e.g. every frame attempt failed) must not be
+        // uploadable as an empty part -- that's not a real event.
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_envelope_header(1, 0));
+        body.extend_from_slice(&encode_part_header(PartKind::Thumbnail, Encoding::Jpeg, 0, 0, 0));
+
+        let (header, rest) = decode_envelope_header(&body).expect("valid envelope header");
+        let err = PartsIter::new(rest, header.part_count)
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("zero-length part should be rejected");
+        assert_eq!(err, EnvelopeError::EmptyPart(PartKind::Thumbnail));
     }
 }
