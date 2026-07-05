@@ -1,0 +1,6 @@
+// Copy this file to `server/src/config.rs` (gitignored -- never committed)
+// and set a real random token. Must match
+// `firmware/src/wifi_credentials.rs`'s UPLOAD_TOKEN exactly -- generate one
+// with e.g. `openssl rand -hex 16` and put the same value in both files.
+
+pub const UPLOAD_TOKEN: &str = "generate-your-own-random-token-here";

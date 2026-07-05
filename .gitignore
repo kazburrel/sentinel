@@ -1,2 +1,5 @@
 target/
 .DS_Store
+firmware/src/wifi_credentials.rs
+server/src/config.rs
+server/uploads/

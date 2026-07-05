@@ -16,6 +16,11 @@ async runtime via `esp-rtos`).
   printed on the camera module's ribbon cable.
 - AM312 PIR sensor, wired: `VCC→3V3`, `OUT→GPIO21`, `GND→GND`
 - Onboard WS2812 addressable RGB LED on GPIO48
+- **Built-in microSD/TF-card slot confirmed** from Freenove's board documentation.
+  It uses the ESP32-S3 SDMMC peripheral in 1-bit mode: CMD=GPIO38, CLK=GPIO39,
+  DATA0=GPIO40. The user has a 1GB card available, but it has not yet been inserted,
+  formatted, or tested with this firmware. Use FAT32 for the first test; insert/remove
+  only while the board is powered off.
 - Camera pin map (confirmed correct for this board): XCLK/MCLK=15, PCLK=13, VSYNC=6,
   HREF=7, D0-D7=11,9,8,10,12,18,17,16, SCCB SDA=4, SCCB SCL=5
 - Dev machine: MacBook Pro M1 Max, macOS Darwin 25.5.0, Apple Silicon
@@ -540,10 +545,9 @@ state-machine bug:
 
 **Decision, now implemented:** `TAIL_DURATION` raised from 2 seconds to 5 seconds in
 `firmware/src/bin/main.rs`, no other event behavior changed. Built clean (`cargo build`
-+ `cargo clippy`, both with zero warnings) and flashed to hardware. **The
-slow-lowering re-test to confirm this actually fixes the early-stop behavior has not
-been run/confirmed yet** -- the user was mid-test (via `scripts/capture_psram_video.sh`)
-when this doc was last updated; result pending.
++ `cargo clippy`, both with zero warnings), flashed, and tested on hardware. The user
+confirmed the camera behavior, including the revised motion tail, is tested and the
+camera phase is complete.
 
 ### Dev convenience: `RECORDING_ENABLED` compile-time toggle
 
@@ -566,6 +570,11 @@ stopgap until then.
 
 ### Known deferred limitations
 
+- **USB-to-Mac delivery already works.** After recording, firmware exports the clip
+  over native USB serial; the existing Mac script receives it, reconstructs it, and
+  produces a playable video. The upcoming transport milestone is not the first ability
+  to send or view recordings on the Mac -- it replaces this proven wired/debug path
+  with WiFi and a persistent Mac server.
 - The first valid JPEG is preserved in RAM as a thumbnail, but it is not separately
   exported or saved yet. Its transport/storage policy belongs with WiFi/server work.
 - Raw USB clip export is synchronous and blocks motion detection. Motion occurring
@@ -596,16 +605,318 @@ protocol/server design must not hardcode an event as "video only."
 - This is a future-proofing requirement for the WiFi/server-transfer milestone, not a
   claim that audio recording is currently implemented.
 
+### Future local fallback storage — onboard microSD
+
+The board does have an onboard microSD/TF-card slot, so no external SD module or
+jumper wiring is required. The available 1GB card could later provide persistent local
+storage when WiFi or the Mac/mini-computer server is unavailable.
+
+- Intended future flow: record temporarily into PSRAM, save/queue the completed event
+  on microSD when needed, upload over WiFi, then delete it from the card only after a
+  successful server acknowledgement.
+- SD support is not implemented or hardware-tested yet. It will require Rust SDMMC
+  support, a FAT filesystem, event filenames/indexing, capacity handling, and a safe
+  retention/deletion policy.
+- GPIO38, GPIO39, and GPIO40 must be reserved for the onboard 1-bit SDMMC connection
+  and not assigned to unrelated peripherals if this feature is added.
+- This remains a separate milestone after basic HTTP upload to the Mac server works;
+  it does not replace or delay the immediate WiFi transport work.
+
+## Milestone 11 — WiFi connectivity (scan + connect, verified on hardware)
+
+First real step of the WiFi/transport phase: prove the radio and network stack work
+at all before building any HTTP/server logic on top, matching this project's
+established pattern (a dedicated standalone test binary per new subsystem, e.g. the
+PSRAM smoke test in Milestone 7). Grounded every API in the real `esp-radio 0.18.0`/
+`embassy-net 0.9.1` source before writing code (same discipline as the PSRAM work):
+confirmed `esp_radio::wifi::new(peripherals.WIFI, Default::default())` returns
+`(WifiController, Interfaces)`, that `Interfaces::station` (an `Interface<'d>`)
+implements the `embassy_net_driver::Driver` trait required by `embassy_net::new()`,
+and the exact `StationConfig`/`Config::Station`/`set_config`/`connect_async` sequence
+from the crate's own doc examples rather than guessing.
+
+- **`firmware/src/bin/wifi_scan_test.rs`** (new): no credentials needed -- calls
+  `controller.scan_async(&ScanConfig::default().with_max(20))`, sorts by signal
+  strength, prints SSID/channel/RSSI/auth method every 15s. Used to find the user's
+  real network before writing any connection code. **Verified on hardware**: found
+  4-5 real nearby networks correctly (including two `CommunityFibre10Gb_*` SSIDs, an
+  extender, and others), RSSI values sensible (-45 to -71 dBm).
+- **`firmware/src/bin/wifi_test.rs`** (new): connects to a real network via
+  `StationConfig`, brings up an `embassy_net::Stack` (a background `net_task` spawned
+  via `Spawner` drives the `Runner`), waits for `stack.wait_config_up()`, reports the
+  DHCP-assigned IP repeatedly. **Verified on hardware, first real attempt**: connected
+  to the user's actual WiFi network, DHCP assigned `192.168.1.204` (gateway
+  `192.168.1.1`), connection held stable across multiple heartbeat checks (didn't
+  drop).
+- **Credentials handling**: `firmware/src/wifi_credentials.rs` added to `.gitignore`
+  (holds the real SSID/password, pulled in via `include!("../wifi_credentials.rs")`
+  from both WiFi test binaries) with `firmware/src/wifi_credentials.rs.example`
+  committed as the template. Confirmed via `git check-ignore -v` and `git status`
+  that the real-credentials file never appears as trackable.
+- Small API-fitting fixes needed during implementation (all found by the compiler,
+  not guessed in advance): `set_config()` already starts the controller (no separate
+  `.start()` call), `is_connected()` returns a plain `bool` not a `Result`, spawning
+  the `net_task` requires unwrapping the `Result<SpawnToken, SpawnError>` the task
+  function itself returns before passing it to `spawner.spawn()` (which takes a bare
+  token and returns `()`, not a `Result`), and the device type for `Runner`/`Stack` is
+  `esp_radio::wifi::Interface`, not a `WifiDevice` type (which doesn't exist in this
+  crate version).
+
+## Milestone 12 — HTTP POST proven end-to-end (ESP32 -> WiFi -> Mac server)
+
+Grounded the TCP API the same way as everything since Milestone 7: read
+`embassy-net 0.9.1`'s real `tcp.rs` source before writing code, confirming
+`TcpSocket::new(stack, rx_buffer, tx_buffer)`, that it implements
+`embedded_io_async::{Read, Write}` (so `write_all`/`read` are available, no extra HTTP
+client crate needed), and that `connect()` accepts anything `Into<IpEndpoint>`
+(a `(IpAddress, u16)` tuple, per smoltcp's `wire::ip::Endpoint` `From` impl).
+
+- **`server/src/main.rs`** replaced with a minimal HTTP receiver (plain `std`, no
+  dependencies added): `TcpListener` accept loop, reads until the header-ending blank
+  line, extracts `Content-Length`, reads exactly that many body bytes, prints both,
+  replies `200 OK`. Deliberately not a real router/parser -- this proves the pipe,
+  not the protocol.
+- **`firmware/src/bin/http_post_test.rs`** (new): same WiFi connection logic as
+  `wifi_test.rs`, then opens a `TcpSocket` to `SERVER_IP:SERVER_PORT` (new consts in
+  the gitignored `wifi_credentials.rs`/`.example`) and sends a hand-written HTTP/1.1
+  POST request with a small text body every 10s, printing the server's response.
+- **Verified on hardware, full round trip**: board connected to the Mac's server,
+  server correctly parsed and printed each request's body
+  (`hello from esp32-s3, post #N`), board received and printed a real `200 OK`
+  response -- repeated successfully across multiple posts, not just once.
+- **One real bug caught and fixed**: the `Host` header was being built with
+  `{SERVER_IP:?}` (debug-formatting the raw `[u8; 4]` as `[192, 168, 1, 21]`) instead
+  of a proper dotted-decimal string. Doesn't break the receiving end (the minimal
+  server ignores `Host` entirely), but fixed for correctness and reverified on
+  hardware (confirmed `Host: 192.168.1.21:8080` in the next capture).
+
+### Security threat model — camera and personal devices share the LAN
+
+The WiFi proof places the ESP32 camera on the same home subnet as the Mac, phones,
+PS5, and other personal devices. Sharing a subnet does not automatically give the
+camera control of those devices, but it creates a possible lateral-movement path: if
+any one LAN device is compromised, an attacker can probe other reachable devices.
+Conversely, an untrusted LAN client can currently connect to the development receiver
+on the Mac while it is running.
+
+The Milestone 12 receiver is intentionally a transport experiment, **not a secure
+server**. Review of the actual code confirms that it currently binds to `0.0.0.0:8080`,
+uses plaintext HTTP, accepts requests without authentication, grows its request buffer
+without a size limit, has no read timeout, handles clients serially, and returns
+`200 OK` even if a body ends early. It is acceptable only as a temporary trusted-LAN
+test and must not be exposed through router port forwarding, UPnP, or the public
+internet. Real camera images/video must not be wired into this receiver until the
+minimum protections below are added.
+
+Security requirements for the real local upload path:
+
+- Add per-device authentication to every upload. Keep the secret out of git, compare
+  it on the server, and reject missing/invalid credentials before storing a body.
+- Enforce a small header limit, an explicit maximum payload size, read timeouts,
+  exact-body validation, allowed routes/methods/content types, and safe server-chosen
+  filenames under one dedicated storage directory. Never accept a client-provided
+  filesystem path.
+- Return success only after the complete validated event is safely stored; use clear
+  error responses so firmware can retry without treating a partial upload as complete.
+- Keep the macOS firewall enabled and allow only the required server process/port.
+  Keep router WPA2/WPA3, router firmware, admin credentials, firewall, and WiFi
+  password secure; disable remote administration, WPS, UPnP, and port forwarding when
+  they are not explicitly required.
+- Add transport encryption before uploads cross an untrusted network. Plain HTTP on
+  the present trusted development LAN is only an intermediate bring-up step; its
+  authentication token and camera footage are otherwise visible to a device capable
+  of observing that traffic.
+- Long term, place the camera on a dedicated IoT VLAN/SSID and allow only the minimum
+  route `camera -> Mac/mini-computer upload port`; block camera access to phones, PS5,
+  general Mac services, and other LAN clients. A normal guest network with client
+  isolation may also block the required camera-to-server connection, so isolation
+  rules must deliberately permit that one path.
+- The ESP32 should remain an outbound upload client, with no general-purpose inbound
+  web/admin service unless a later feature genuinely requires one.
+
+## Milestone 13 — receiver hardened per the security threat model
+
+Implemented the full checklist from Milestone 12's security review before any real
+camera footage gets wired in. Nothing here is a new architecture -- same minimal
+`POST /upload` receiver, now actually safe to point a real (if still trusted-LAN-only)
+upload at.
+
+- **Auth token**: a shared secret (`X-Upload-Token` header) generated with
+  `openssl rand -hex 16`, stored in gitignored config on both ends --
+  `firmware/src/wifi_credentials.rs` (`UPLOAD_TOKEN`, alongside the existing WiFi/
+  server consts) and the new `server/src/config.rs` -- with `.example` templates for
+  both committed. **Verified on hardware**: a request without/with the wrong token
+  gets rejected with `401 Unauthorized`; the correct token succeeds.
+- **Bounded parsing**: `MAX_HEADER_BYTES` (8KB) and `MAX_BODY_BYTES` (12MB --
+  comfortably above the ~8MB/35-50s PSRAM clip ceiling measured in Milestone 10,
+  without being unbounded) both enforced before any data past those limits is
+  buffered; a 10-second read timeout so a stalled connection can't hang the server
+  forever.
+- **Exact-body validation**: `read_exact_body()` now returns a real error
+  (`BodyTruncated`) instead of the old behavior of silently returning `200 OK` on a
+  connection that closed before `Content-Length` bytes arrived.
+- **Method/route validation**: only the literal request line `POST /upload HTTP/1.1`
+  is accepted; anything else is rejected before any body is even read.
+- **Safe storage**: server-chosen filenames only (`upload_<unix_millis>.bin`, never
+  derived from client input) under one dedicated `server/uploads/` directory.
+- **Correct acknowledgements**: a `RequestError` enum maps each failure to the right
+  HTTP status (`401`, `411`, `413`, `431`, `400`) instead of always returning `200`.
+- **One real bug caught during hardware verification, not before**: `UPLOADS_DIR` was
+  a plain relative `"uploads"` path, which resolves relative to whatever directory the
+  binary happens to be launched from -- `cargo run -p server` from the workspace root
+  put files at the repo root (`/uploads/`), outside `server/` entirely and outside the
+  `.gitignore` pattern (`server/uploads/`) meant to cover them. Fixed with
+  `concat!(env!("CARGO_MANIFEST_DIR"), "/uploads")`, an absolute path baked in at
+  compile time, independent of the launch directory. Reverified on hardware after the
+  fix: uploads land at `server/uploads/` and are correctly gitignored there (confirmed
+  via `git check-ignore -v`); the stray root-level files from before the fix were this
+  session's own test artifacts and were deleted.
+- Still deliberately deferred, per the threat model: TLS and IoT network segmentation.
+  This remains a trusted-LAN development tool, not something to expose beyond that.
+
+### Post-Milestone 13 security review — two changes required
+
+Codex reviewed the actual hardened receiver rather than relying only on the milestone
+description. The server builds cleanly, and the authentication, body-size limit,
+timeout, exact-body validation, safe storage path, and successful-write acknowledgement
+are present. Two follow-up changes were identified/decided before real camera footage
+is uploaded:
+
+1. **Fix the header-limit boundary check.** `read_headers()` currently searches for
+   `\r\n\r\n` before checking whether the buffer has grown beyond
+   `MAX_HEADER_BYTES`. Because reads happen in 4KB chunks, a terminator arriving in
+   the chunk that pushes the buffer beyond 8KB can be accepted. Enforce the limit on
+   the terminator position/bytes consumed immediately after each read, and add tests
+   for a header exactly at the limit and one just over it. Until fixed, the claim that
+   the 8KB header limit is fully enforced is not exact.
+2. **Use one generic `404 Not Found` response for concealment.** Per user preference,
+   unknown routes, missing upload tokens, and incorrect upload tokens should all return
+   the same minimal `404 Not Found` response. Server-side logs may record a generic
+   rejection reason but must never print the supplied or expected token. This avoids
+   confirming that `/upload` is a real authenticated endpoint. It is an additional
+   concealment layer, not a replacement for authentication, rate limiting, or future
+   TLS. The current implemented behavior is still `401 Unauthorized` for failed auth
+   until this small response-mapping change is made and retested.
+
+### Both post-review gaps closed and reverified
+
+- **Header-limit boundary, fixed**: `read_headers()` in `server/src/main.rs` now checks
+  `buf.len() > MAX_HEADER_BYTES` *before* searching for the `\r\n\r\n` terminator each
+  iteration, not after -- so a terminator arriving in the same read that pushes the
+  buffer past the limit no longer bypasses the rejection. **Verified**: a request with a
+  ~20KB custom header now correctly triggers `HeadersTooLarge` (confirmed in the
+  server's own log, `request failed: HeadersTooLarge`).
+- **Generic 404, implemented**: `RequestError::status_line()` now maps both
+  `BadRequestLine` (unknown route) and `Unauthorized` (missing/wrong token) to the
+  identical `"HTTP/1.1 404 Not Found"` response. Logging already never printed the
+  token itself (only "missing/invalid X-Upload-Token" or the submitted request line),
+  so no logging change was needed.
+- **Verified on the running server with `curl`, all four cases**:
+  - Valid token -> `200 OK`
+  - Missing token -> `404 Not Found`
+  - Wrong token -> `404 Not Found`
+  - Unknown route (`POST /nonexistent`) -> `404 Not Found`
+  - All three failure responses confirmed byte-for-byte identical, and distinct from
+    the `200 OK` success case.
+- Real board traffic (`http_post_test.rs`, still running throughout this test session)
+  kept succeeding the whole time, confirming the fixes didn't regress the legitimate
+  path.
+- Test upload artifacts from this verification pass were this session's own throwaway
+  data and were deleted afterward; nothing real was stored.
+
+### Second Codex review — remaining pre-media cleanup
+
+The two first-review fixes are genuinely present and `cargo check -p server` remains
+clean. The receiver is now a **minimally hardened trusted-LAN prototype**, not a fully
+hardened production server. A second review of the actual code found these remaining
+items:
+
+1. **Header accounting is safe but overly broad.** The new check closes the original
+   bypass, but it compares `buf.len()` with `MAX_HEADER_BYTES`. That buffer can already
+   contain body bytes read in the same TCP chunk as the header terminator, so a valid
+   header close to 8KB could be rejected merely because some body bytes arrived with
+   it. Locate `\r\n\r\n`, compare its end position (the true header length) with the
+   limit, and only use total buffer length to reject a still-unterminated header.
+2. **The requested boundary tests do not exist in the codebase yet.** Hardware/curl
+   testing proved that a ~20KB header is rejected, but there are no automated tests for
+   a header exactly at the allowed boundary and one byte over it. Add those tests,
+   including a valid near-limit header with body bytes coalesced into the same read.
+3. **Timestamp-only storage names are not collision-proof.**
+   `upload_<unix_millis>.bin` can theoretically overwrite an earlier upload created in
+   the same millisecond. Structured event storage should use a unique event ID and/or
+   collision-safe file creation; it must never silently replace an accepted event.
+
+Still deliberately later rather than blockers for the next trusted-LAN experiment:
+TLS, rate limiting, atomic temporary-file/rename storage, firmware retry behavior, and
+IoT VLAN isolation. These are why project language should say "minimally hardened for
+a trusted development LAN," not "fully hardened."
+
+### All three second-review findings fixed and verified
+
+- **Header-length accounting, fixed**: `read_headers()` in `server/src/main.rs` is now
+  generic over `Read` (was hardcoded to `TcpStream`, blocking unit testing) and checks
+  the limit against the *header's own length* (the `\r\n\r\n` terminator's position),
+  not the total accumulated buffer -- a small, valid header no longer gets wrongly
+  rejected just because body bytes happened to arrive coalesced into the same TCP
+  read. The "no terminator yet" branch still checks total buffer length, which is
+  correct there since every byte read so far genuinely is header content until a
+  terminator actually appears.
+- **Automated boundary tests, added**: 4 new `#[cfg(test)]` unit tests in
+  `server/src/main.rs` using `std::io::Cursor` as an in-memory `Read` mock (no real
+  socket needed) -- header exactly at the limit (accepted), one byte over (rejected),
+  a header under the limit with body bytes coalesced in (accepted, the actual bug this
+  guards against), and an unterminated blob past the limit (rejected). All 4 pass
+  (`cargo test -p server`). One test's first draft had a wrong assertion (expected
+  `read_headers` to slurp every byte provided to the mock reader before returning, when
+  it correctly returns as soon as the terminator is found in whatever a single read
+  pass produced) -- caught by the test failing, not assumed; fixed the assertion, not
+  the implementation.
+- **Third-review catch, fixed**: the coalesced-body test's first version used a
+  100-byte header, which `read_headers()`'s 4096-byte read chunk finds and returns on
+  the very first read -- buf.len() never got anywhere near the 8192-byte limit, so the
+  test didn't actually exercise the boundary its name claimed to guard. Root cause: the
+  read loop pulls a fixed 4096-byte chunk per call, and the limit (8192) is an exact
+  multiple of that chunk size, so buf.len() at terminator-discovery can only ever reach
+  *up to* the limit, never past it, while header_len stays under it -- reaching past it
+  would require the terminator itself to sit beyond the limit, which is a reject case,
+  not an accept case. Fixed by using an 8000-byte header (forces two full reads before
+  the terminator is found) plus a trailing coalesced body large enough that the second
+  read is a full 4096-byte chunk, landing buf.len() exactly on `MAX_HEADER_BYTES`
+  (8192) while header_len (8000) stays comfortably under it -- the strongest gap
+  reachable given the chunk/limit relationship. Verified the test actually catches a
+  regression: temporarily reintroduced a `buf.len() >= MAX_HEADER_BYTES` bug in the
+  found-terminator branch, confirmed both this test and the exact-limit test failed,
+  then restored the correct `header_len > MAX_HEADER_BYTES` check and re-ran clean.
+- **Collision-safe storage, fixed**: new `store_upload()` uses
+  `OpenOptions::new().create_new(true)`, which atomically fails if the target filename
+  already exists, retrying with an incrementing `_N` suffix on collision instead of
+  ever silently overwriting a previously-stored upload. **Verified with a real
+  concurrent 5-request burst** that genuinely collided on the same millisecond
+  timestamp -- all 5 preserved as `upload_<ts>.bin`, `_1.bin`, `_2.bin`, `_3.bin`,
+  `_4.bin`, each with its distinct correct body intact, none overwritten.
+- **Full regression re-verified live** against the doubly-fixed server: valid token ->
+  `200`, missing token -> `404`, unknown route -> `404`, ~20KB oversized header ->
+  rejected (server log confirms `HeadersTooLarge`) -- real board traffic
+  (`http_post_test.rs`) kept succeeding throughout. Test artifacts from this
+  verification pass were deleted afterward.
+
 ## Next steps (not yet started)
 
-- **Confirm the 5s tail actually fixes the early-stop behavior**: `TAIL_DURATION` is
-  already raised to 5s and flashed (see Milestone 10 above) -- what's left is running
-  the same slow-lowering motion test again and confirming the recording now covers the
-  whole motion, including the drop. If it still cuts off early, the AM312's own
-  blind/retrigger timing may need more than 5s of margin, or a different mitigation.
-- Decide what happens to a recorded clip after export (export automatically over
-  serial like the test binary? only on request? relates directly to the still-pending
-  WiFi/upload milestone below, which is the real intended transport).
+- **Wire real camera/event data into the minimally hardened trusted-LAN HTTP path**
+  instead of the placeholder text body -- send an actual captured JPEG or
+  PSRAM-recorded clip's bytes, now that WiFi connectivity (Milestone 11), basic POST
+  (Milestone 12), and two rounds of receiver hardening (Milestone 13) are all
+  independently proven.
+- Build out the `server` crate beyond the minimal receiver: real request routing and
+  structured event storage (currently just raw bytes to a timestamped file) instead of
+  an undifferentiated blob.
+- Define richer acknowledgement/retry semantics for wireless uploads (the receiver
+  already returns correct HTTP status codes; the firmware side doesn't yet act on
+  failure beyond printing it).
+- **Replace the wired delivery path with WiFi** in `main.rs` itself once real
+  event data is flowing over HTTP -- the current ESP32 -> USB serial -> Mac script
+  path already exports recordings and produces playable video; preserve it as a
+  debugging/fallback path while adding ESP32 -> WiFi -> Mac server delivery.
 - Optionally investigate the FPS gap noted in Milestone 7 (PSRAM copy overhead: ~12-14
   FPS vs. Milestone 6's 20.06 FPS) if smoother recorded video is wanted.
 - Act on the image-quality findings from the investigation above once a sample image is
@@ -613,36 +924,51 @@ protocol/server design must not hardcode an event as "video only."
   JPEG quality — all cheap, safe, no code written yet pending user direction.
 - Optionally hand the community/undocumented-tricks research (image quality
   investigation, point 7) to Codex.
-- **WiFi upload to the server.** The actual next major project milestone per the
-  stated goal above — right now a captured JPEG/clip only ever sits in RAM/PSRAM and
-  gets dumped to serial for local debugging. The real pipeline needs: connect to WiFi
-  (`esp-radio`/`embassy-net`, both already in `Cargo.toml`), POST the captured bytes to
-  the `server` crate (already scaffolded in the workspace, not yet implemented), get a
-  response back, decide what to do with it (eventually: phone notification). During
-  this milestone, replace the untouched `shared` crate stub with the extensible event
-  envelope described above: thumbnail/video now, optional audio later.
+- Once HTTP POST + server are proven, replace the untouched `shared` crate stub with
+  the extensible event envelope described above (thumbnail/video now, optional audio
+  later). AI processing and phone notifications remain later milestones.
+- **Later: onboard microSD offline queue/fallback.** After WiFi upload and server
+  acknowledgement are reliable, test the user's 1GB FAT32 card through the built-in
+  1-bit SDMMC slot (GPIO38/39/40), then add save-on-upload-failure and delete-on-ack
+  behavior. Do not mix this into the initial HTTP proof-of-concept.
 - `FOR_CODEX.md`'s original content (UPDATE 1-8) can likely be deleted entirely now —
   it documents a hang that was never real, and is superseded by this file.
 
 ## Current exact codebase state
 
-**Committed to git** (through `6da4771`, Milestone 8): PIR + WS2812 (milestones 1-3),
-OV3660 camera capture (Milestone 4), reusable `CameraHandle` + PIR integration
+**Committed to git** (through `b30dde0`, Milestones 9-10): PIR + WS2812 (milestones
+1-3), OV3660 camera capture (Milestone 4), reusable `CameraHandle` + PIR integration
 (Milestone 5), continuous capture/MJPEG video/UXGA/3x FPS fix (Milestone 6),
 PSRAM-backed record-then-export (Milestone 7), motion-triggered PSRAM recording as a
-standalone test binary (Milestone 8), workspace structure, `shared`/`server`
-scaffolding.
+standalone test binary (Milestone 8), the doorbell-style event state machine moved
+into `main.rs` with strict JPEG validation (Milestones 9-10), workspace structure,
+`shared`/`server` scaffolding. `RECORDING_ENABLED` is `false` in the committed code
+(verified via `git show b30dde0:firmware/src/bin/main.rs`) -- this was the value in
+the working tree at commit time, so recording is currently off; flip to `true` and
+reflash to re-enable motion-triggered recording.
 
-**Uncommitted, current** (Milestones 9 and 10, described above):
-- `firmware/src/bin/main.rs` — Milestone 9's relocation, then Milestone 10's full
-  doorbell-style event state machine on top (min duration, tail, renewed-motion
-  handling, thumbnail preservation, no fixed max), then `TAIL_DURATION` raised
-  2s → 5s (built, clippy-checked, flashed; hardware re-test result pending), then a
-  `RECORDING_ENABLED` dev-convenience toggle added -- **currently set to `false`**
-  in the working tree (user flipped it directly in the editor for their current dev
-  session; not yet reflashed with this value as of this doc update)
-- `firmware/src/camera.rs` — `trim_to_jpeg()` now returns `Result`, new
-  `CameraError::InvalidJpeg` variant
+**Uncommitted, current** (Milestones 11-13, described above):
+- `firmware/src/bin/wifi_scan_test.rs` — new, standalone WiFi network scanner
+- `firmware/src/bin/wifi_test.rs` — new, WiFi STA connection + DHCP test
+- `firmware/src/bin/http_post_test.rs` — new, WiFi + hardened HTTP POST (sends
+  `X-Upload-Token`) to the `server` crate, verified round trip on hardware
+- `firmware/Cargo.toml` — `[[bin]]` entries for all three
+- `.gitignore` — excludes `firmware/src/wifi_credentials.rs`, `server/src/config.rs`,
+  `server/uploads/`
+- `firmware/src/wifi_credentials.rs.example` — committed template (real credentials
+  file itself is gitignored, confirmed via `git check-ignore -v`); includes
+  `SERVER_IP`/`SERVER_PORT`/`UPLOAD_TOKEN`
+- `server/src/main.rs` — replaced `Hello, world!` scaffolding with a hardened HTTP
+  receiver: auth token, bounded header/body sizes, read timeout, exact-body
+  validation, correct per-failure HTTP status codes (plain `std`, no new
+  dependencies); first-review fixes (strict header size boundary, generic `404` for
+  unknown route/missing/wrong token); second-review fixes (`read_headers()` measures
+  the header's own length not total buffer, now generic over `Read` for testability;
+  `store_upload()` uses `create_new(true)` with a retry suffix for collision-safe
+  filenames); 4 `#[cfg(test)]` unit tests covering the header-boundary logic
+  (`cargo test -p server`)
+- `server/src/config.rs` — new, gitignored, holds the real `UPLOAD_TOKEN`
+- `server/src/config.rs.example` — new, committed template
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
@@ -672,28 +998,37 @@ scaffolding.
 
 ## What's needed from Codex right now
 
-Nothing blocking — **Milestones 5 through 10 are complete** (reusable `CameraHandle`,
-PIR-triggered capture, continuous-capture MJPEG video pipeline, UXGA resolution, 3x FPS
-fix, PSRAM-backed record-then-export, motion-triggered PSRAM recording, and now a real
-doorbell-style event state machine in `main.rs` -- min duration, continue-while-active,
-post-motion tail with restart-on-renewed-motion, no fixed maximum, thumbnail
-preservation, strict JPEG validation -- all verified repeatedly on hardware, including
-a real 33-second walk-around producing a valid clip). Of the user's original
-product-behavior gap list, everything is now done except: an actual export-timing
-policy decision (still immediate raw USB dump every time, not yet tied to the
-still-pending WiFi milestone), and circular pre-roll (explicitly deferred, not needed
-yet).
+Nothing blocking — **the entire camera phase (Milestones 1-10) is complete and
+committed**, and **the WiFi/transport foundation (Milestones 11-13) is verified on
+hardware end-to-end, including security hardening and BOTH rounds of post-review
+follow-up fixes**: the board scans real nearby networks, connects to the user's actual
+WiFi, gets a stable DHCP IP, and sends authenticated HTTP uploads (`X-Upload-Token`) to
+a receiver that enforces a *strictly* bounded header size (measured against the
+header's own length, not the total buffer, so a body coalesced into the same TCP read
+can't trigger a false rejection), a bounded body size, a read timeout, exact
+body-length validation, collision-safe server-chosen storage filenames
+(`create_new(true)` with a retry suffix), and returns an identical generic `404` for
+unknown routes, missing tokens, and wrong tokens (verified with `curl`: all three
+byte-for-byte identical, distinct from the `200 OK` success case). The header-boundary
+logic now also has 4 automated `#[cfg(test)]` unit tests (`cargo test -p server`)
+covering exact-limit, over-limit, coalesced-body, and missing-terminator cases, so
+future changes don't need hand-verification every time. Every API and fix was
+grounded/verified against real source or real behavior before being trusted, same
+discipline throughout: two real bugs in Milestone 12/13 (malformed `Host` header, a
+relative storage path), and each review pass caught real bugs in the previous
+"hardened" code (header-limit-bypass, then header-length miscounting, missing tests,
+and a filename-collision risk) before any real camera data touched it.
 
-**Resolved behavior question:** AM312 timing research found that its approximately
-2-second trigger/hold and blocking behavior leaves no useful margin when paired with
-the firmware's previous 2-second tail. `TAIL_DURATION` is now raised to 5 seconds,
-built and flashed -- the same slow-lowering hardware test needs to be repeated to
-confirm this actually resolves the early-stop behavior. Not yet confirmed either way.
+**Immediate next step**: wire actual camera/event data into the now-twice-hardened
+trusted-LAN HTTP path and build the extensible shared payload envelope (thumbnail/video
+now, optional audio later). The longer-term deployment design is still a dedicated IoT
+network/VLAN that permits only the camera-to-server upload path plus TLS; the current
+shared home subnet + plaintext HTTP is a development setup, not the final security
+boundary -- but the receiver itself has now been through two rounds of review and
+hardening, not just one, with automated regression coverage for the trickiest part of
+its parsing logic.
 
 Also still open, lower priority: trawling GitHub issues/forums/Reddit/Discord for
 OV3660-specific community register tweaks for image quality (see "Image quality
 investigation" above, point 7) — deliberately not fabricated here since there's no live
-access to those discussions in this session. Otherwise open to input on export-timing
-policy, or the next major milestone, WiFi + upload to the server (see "Next steps"
-above), e.g. `esp-radio`/`embassy-net` setup specifics or server request format, but
-nothing is currently blocked.
+access to those discussions in this session. Nothing is currently blocked.
