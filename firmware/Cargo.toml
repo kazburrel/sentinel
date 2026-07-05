@@ -38,6 +38,10 @@ path = "./src/bin/psram_test.rs"
 name = "psram_record_test"
 path = "./src/bin/psram_record_test.rs"
 
+[[bin]]
+name = "motion_record_test"
+path = "./src/bin/motion_record_test.rs"
+
 [dependencies]
 shared = { path = "../shared" }
 

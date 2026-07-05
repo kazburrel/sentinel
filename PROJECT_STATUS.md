@@ -411,18 +411,48 @@ is avoided by construction, not by discipline.
   worth optimizing (e.g. capturing directly into PSRAM instead of scratch-then-copy)
   or simply an acceptable cost for the architecture that actually supports real
   multi-second recording without a tethered Mac mid-capture.
-- **Not yet done (this milestone stops here deliberately)**: recording is still
-  triggered by boot/reset, exactly like Milestone 6's test binaries -- it is **not**
-  wired to PIR motion yet. That was the last step of Codex's recommended sequence
-  ("only then connect this recorder to PIR motion") and hasn't been started.
+## Milestone 8 — motion-triggered PSRAM recording (standalone test binary, verified)
+
+Committed in Milestone 7's deliberately-deferred last step: wired the PSRAM recorder
+to real PIR motion instead of boot/reset. Per plan, built as a separate test binary
+first, not yet folded into `main.rs`.
+
+- **`firmware/src/bin/motion_record_test.rs`** (new): combines `main.rs`'s PIR/LED
+  pattern with Milestone 7's `PsramRecorder`/`CameraHandle`. On `MotionEdge::Detected`:
+  LED red, `recorder.reset()`, record a fixed 5s VGA burst via
+  `capture_jpeg_continuous` (same no-warmup fast path as the continuous-capture test
+  binaries), export the clip as a raw binary dump (`RAW EXPORT BEGIN`/`END` markers,
+  same format as Milestone 7), LED off, print `waiting for next motion event...`, then
+  re-sync the debounced `MotionSensor` state (`MotionSensor::new(pir.is_high())`) so a
+  body still present right after recording doesn't immediately register as a fresh
+  edge. Also added a 10-second idle heartbeat print while waiting for motion --
+  without it, the first test run produced a completely empty log for 80+ seconds of
+  waiting with no way to tell "no motion yet" from "board is stuck," the exact
+  observability trap this project's own hard-learned lesson (Milestone 4) warns about.
+- **Verified on hardware, multiple independent runs**: two recordings in one boot
+  (63 frames/0 failures, then 55 frames/0 failures); a later run, 61 frames/0 failures
+  on its own boot. Every run: LED response correct, recorder correctly reset between
+  events, zero crashes, zero failed frames across all runs.
+- **Verified the full export-to-video path still works** with this trigger source, not
+  just the boot-triggered one: decoded and assembled two separate motion-triggered
+  recordings into playable `.mp4`s (640x480, ~5.05s each, 12-12.5 FPS measured from real
+  timestamps) via the existing `decode_raw_capture.py`/`ffmpeg` pipeline.
+- Per explicit request, `scripts/capture_psram_video.sh` (already built in Milestone 7)
+  works unchanged for this trigger source too -- flash `motion_record_test`, run the
+  script, wave, and it waits for the `RAW EXPORT END` marker and produces a video on
+  the Desktop automatically, no manual log-capture/decode steps needed.
+- **Not yet done**: still a standalone test binary, not integrated into `main.rs`. Per
+  the plan ("Once hardware-verified, integrate it into the main firmware"), this is
+  now hardware-verified and ready for that integration.
 
 ## Next steps (not yet started)
 
-- **Wire the PSRAM recorder to PIR motion** (Milestone 7's deliberately-deferred last
-  step): on motion detected, run the ~5-10s PSRAM-backed recording instead of (or in
-  addition to) the existing single-photo capture in `main.rs`; decide what happens to
-  the recorded clip afterward (export automatically? only on request? relates directly
-  to the still-pending WiFi/upload milestone below).
+- **Integrate `motion_record_test.rs` into `main.rs`**: fold the verified
+  motion-triggered PSRAM recording behavior into the real firmware, replacing or
+  supplementing the current single-photo-per-motion-event behavior.
+- Decide what happens to a recorded clip after export (export automatically over
+  serial like the test binary? only on request? relates directly to the still-pending
+  WiFi/upload milestone below, which is the real intended transport).
 - Optionally investigate the FPS gap noted in Milestone 7 (PSRAM copy overhead: ~12-14
   FPS vs. Milestone 6's 20.06 FPS) if smoother recorded video is wanted.
 - Act on the image-quality findings from the investigation above once a sample image is
@@ -441,22 +471,16 @@ is avoided by construction, not by discipline.
 
 ## Current exact codebase state
 
-**Committed to git** (through `cafe716`, Milestone 6): PIR + WS2812 (milestones 1-3),
+**Committed to git** (through `928777e`, Milestone 7): PIR + WS2812 (milestones 1-3),
 OV3660 camera capture (Milestone 4), reusable `CameraHandle` + PIR integration
-(Milestone 5), continuous capture/MJPEG video/UXGA/3x FPS fix (Milestone 6), workspace
-structure, `shared`/`server` scaffolding.
+(Milestone 5), continuous capture/MJPEG video/UXGA/3x FPS fix (Milestone 6),
+PSRAM-backed record-then-export (Milestone 7), workspace structure, `shared`/`server`
+scaffolding.
 
-**Uncommitted, current** (Milestone 7, described above):
-- `firmware/src/recorder.rs` — new, `PsramRecorder` (length-prefixed frame arena)
-- `firmware/src/bin/psram_test.rs` — new, standalone PSRAM init/pattern-check smoke test
-- `firmware/src/bin/psram_record_test.rs` — new, 5s VGA burst recorded into PSRAM,
-  raw binary export afterward
-- `firmware/src/lib.rs` — declares `pub mod recorder;`
-- `firmware/Cargo.toml` — `[[bin]]` entries for `psram_test`, `psram_record_test`
-- `scripts/decode_raw_capture.py` — new, parses the raw binary export format, computes
-  FPS from real per-frame timestamps
-- `scripts/capture_psram_video.sh` — new, waits for `RAW EXPORT END`, assembles a
-  `.mp4`, keeps individual frames in an auto-deleted temp dir
+**Uncommitted, current** (Milestone 8, described above):
+- `firmware/src/bin/motion_record_test.rs` — new, PIR-triggered version of Milestone
+  7's `psram_record_test.rs`, with an added idle heartbeat print
+- `firmware/Cargo.toml` — `[[bin]]` entry for `motion_record_test`
 - `scripts/capture_video.sh` — modified, same temp-dir-for-frames fix applied
   retroactively (only the final video is saved to the Desktop, not each burst frame)
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
@@ -488,17 +512,19 @@ structure, `shared`/`server` scaffolding.
 
 ## What's needed from Codex right now
 
-Nothing blocking — **Milestones 5, 6, and 7 are complete** (reusable `CameraHandle`,
+Nothing blocking — **Milestones 5 through 8 are complete** (reusable `CameraHandle`,
 PIR-triggered capture in `main.rs`, continuous-capture MJPEG video pipeline, UXGA
-resolution, 3x FPS fix, and now PSRAM-backed record-then-export — all verified
-repeatedly on hardware). Codex's PSRAM research was verified line-by-line against the
-real `esp-hal`/`esp-alloc` source before implementing and matched exactly, including
-the atomics-in-PSRAM warning. Two optional, non-blocking items if useful: (1) wiring
-the PSRAM recorder to PIR motion, the last step of Codex's original recommended
-sequence, not yet started; (2) trawling GitHub issues/forums/Reddit/Discord for
-OV3660-specific community register tweaks for image quality (see "Image quality
-investigation" above, point 7) — deliberately not fabricated here since there's no live
-access to those discussions in this session. Otherwise open to input on the next major
-milestone, WiFi + upload to the server (see "Next steps" above), e.g.
-`esp-radio`/`embassy-net` setup specifics or server request format, but nothing is
+resolution, 3x FPS fix, PSRAM-backed record-then-export, and now motion-triggered
+PSRAM recording via `motion_record_test.rs` — all verified repeatedly on hardware,
+including two independent recordings in a single boot). Codex's PSRAM research was
+verified line-by-line against the real `esp-hal`/`esp-alloc` source before
+implementing and matched exactly, including the atomics-in-PSRAM warning; the
+motion-triggering step it recommended last is now done too. One optional, non-blocking
+item if useful: trawling GitHub issues/forums/Reddit/Discord for OV3660-specific
+community register tweaks for image quality (see "Image quality investigation" above,
+point 7) — deliberately not fabricated here since there's no live access to those
+discussions in this session. Otherwise open to input on the next steps: integrating
+`motion_record_test.rs` into `main.rs`, or the next major milestone, WiFi + upload to
+the server (see "Next steps" above), e.g. `esp-radio`/`embassy-net` setup specifics or
+server request format, but nothing is
 currently blocked.
