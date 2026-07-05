@@ -622,6 +622,120 @@ storage when WiFi or the Mac/mini-computer server is unavailable.
 - This remains a separate milestone after basic HTTP upload to the Mac server works;
   it does not replace or delay the immediate WiFi transport work.
 
+**Codex research result (2026-07-05): an onboard-slot path now exists, but only as an
+unmerged upstream driver.** The original conclusion above was accurate for released
+`esp-hal`, but very recent upstream work changes the practical answer:
+
+- Released `esp-hal` 1.1.1 still has no public `sdmmc` module. The official latest
+  documentation lists the supported peripheral modules and SDMMC is absent. A fresh
+  clone/search of current `esp-rs/esp-hal` main likewise found only the generated
+  `SDHOST` peripheral singleton/signals, not a usable host/card driver.
+- Open, non-draft upstream PR
+  [esp-rs/esp-hal#5760](https://github.com/esp-rs/esp-hal/pull/5760), titled
+  **"SDMMC/SDIO host"**, was opened 2026-06-21 and remained open/unmerged at research
+  time. Its changelog explicitly adds an initial host driver for ESP32, ESP32-S3 and
+  ESP32-P4. Researched exact revision:
+  `cef6d86604d91abcf62afc9804724a637eb7af3a` from contributor branch
+  `bugadani/esp-hal:sdmmc`.
+- Crucially, that PR contains an async ESP32-S3 SD-card/FAT smoke test using the exact
+  Freenove onboard-slot wiring already documented here: SDMMC slot 1, CLK=GPIO39,
+  CMD=GPIO38, DATA0=GPIO40, one-bit mode. It constructs
+  `SdHostController::new(peripherals.SDHOST, Config::default())`, selects
+  `controller.slot::<1>(...)`, attaches those three pins, calls `.into_async()`, then
+  initializes the card through `sdio::sd::Card`. Its FAT test uses
+  `embedded-fatfs`, `embedded-partitions`, and `block-device-adapters` to mount the
+  first FAT partition/superfloppy and perform a non-destructive create, read, update,
+  and delete cycle. Upstream source:
+  [sdmmc_sd_async.rs](https://github.com/bugadani/esp-hal/blob/cef6d86604d91abcf62afc9804724a637eb7af3a/qa-test/src/bin/sdmmc_sd_async.rs).
+- This means the inserted 1GB FAT32 card and built-in slot are viable candidates; an
+  external SPI breakout should **not** be purchased yet. The lack of DAT3/CS still
+  prevents using the onboard slot through SPI-oriented crates such as
+  `embedded-sdmmc`, but it is irrelevant to the new native one-bit SDMMC path.
+- Codex performed a dependency compatibility experiment in an isolated `/tmp` copy,
+  leaving this working tree and lockfile untouched. Replacing only `esp-hal` with the
+  PR revision did **not** work: Cargo produced duplicate native `links` conflicts
+  (`esp_rom_sys`, then `xtensa-lx-rt`) and a registry `esp-rtos` macro mismatch. After
+  pinning/patching the matching `esp-hal` ecosystem crates from the same exact
+  revision (including the HAL/runtime/support crates needed to keep one coherent
+  source set), enabling `esp-hal/__sdmmc`, and retaining the project's compatible
+  `esp-radio 0.18.0`, the **current complete `firmware` binary passed
+  `cargo check --release`**. So the driver can coexist at compile time with this
+  camera/PIR/LED/WiFi firmware, but adopting it is a broader temporary ecosystem pin,
+  not a safe one-line dependency addition.
+- ESP-IDF does have official native SDMMC and SDSPI host/protocol drivers, but they are
+  ESP-IDF driver components, not ROM calls or a small "IDF-lite" library that can be
+  dropped into the current bare-metal `esp-hal`/`esp-rtos` ownership model. Using them
+  directly would require migrating the firmware to the ESP-IDF Rust stack or manually
+  porting/binding a substantial driver, neither justified while the upstream
+  bare-metal PR exists. `esp-bootloader-esp-idf` in this project supplies bootloader
+  compatibility; it does not provide the ESP-IDF runtime or storage drivers.
+
+**Decision / next safe step (as written by Codex):** commit Milestone 16 first, then
+create an isolated, standalone `sdmmc_test` milestone pinned to the exact PR revision
+and matching ecosystem sources. Port only the upstream create/read/update/delete FAT
+smoke test; do not integrate SD into `main.rs` yet. Flash it against the inserted 1GB
+FAT32 card and verify the real slot. If it fails or the dependency override
+destabilizes existing subsystems, revert the isolated experiment and use an external
+3.3V SPI microSD breakout later. If it passes, run full camera/PIR/LED/WiFi regression
+builds and hardware checks before accepting the unreleased dependency set or building
+the queue.
+
+### Result: the onboard slot works -- verified twice on real hardware (Claude)
+
+Milestone 16 was committed first (`0a2feb3`), then a new, fully isolated `sdmmc_test/`
+crate was created (own `Cargo.toml`/`Cargo.lock`/`[workspace]`, not part of `firmware/`'s
+dependency graph or the root workspace's `["server", "shared"]` members -- deliberately
+so this unreleased/experimental dependency pin cannot destabilize the camera/WiFi
+firmware even if it turned out broken):
+
+- Pinned exactly as Codex's research specified: `esp-hal`, `esp-rtos`,
+  `esp-bootloader-esp-idf`, `esp-println`, `esp-backtrace` all as `git` dependencies at
+  `https://github.com/bugadani/esp-hal`, `rev = "cef6d86604d91abcf62afc9804724a637eb7af3a"`;
+  `embedded-fatfs`/`embedded-partitions` at
+  `https://github.com/MabezDev/embedded-fatfs`, `rev = "518528cc111fcf65c48abbdeb80735a38eada112"`;
+  a `[patch.crates-io]` redirecting `block-device-driver`/`block-device-adapters` to that
+  same fork -- reconstructed from the upstream PR's own `qa-test/Cargo.toml` (fetched
+  directly) rather than guessed.
+- Ported `qa-test/src/bin/sdmmc_sd_async.rs` from that exact revision (fetched directly,
+  not paraphrased), trimmed to this board's one chip/pin set (ESP32-S3, 1-bit mode,
+  CLK=GPIO39/CMD=GPIO38/DATA0=GPIO40, SDMMC slot 1) instead of the original's multi-chip
+  `cfg_select!`. Kept the upstream design intact: non-destructive by default, gated
+  behind a BOOT-button (GPIO0) press, operating only on one test-owned file
+  (`ESPQA.TXT`) that's created, read back, updated, read back again, then deleted --
+  never touching anything else on the card. Added this project's own repeating
+  "still alive" heartbeat print around the button-wait loop, matching this project's
+  established lesson about one-shot prints being missed by the serial reader.
+- **First flash attempt failed** (`espflash` error: "appdesc segment not found").
+  Root-caused by comparing ELF symbol addresses and program headers against the known-
+  working `firmware` binary: `esp_app_desc` landed at an IRAM address (`0x00403844`)
+  instead of the expected flash-mapped region (`0x3c000020`), and the binary had
+  collapsed to 3 tiny LOAD segments instead of the proper 5-6 flash/IRAM/DRAM regions.
+  Traced to a genuinely easy-to-miss cause: **the new crate was simply missing the
+  `build.rs` that every esp-hal application crate needs**, which emits
+  `cargo:rustc-link-arg=-Tlinkall.x` (the linker script that actually places sections in
+  the right memory regions) -- this isn't provided automatically by any dependency's own
+  build script (confirmed by diffing verbose `cargo build -v` link commands and every
+  relevant dependency's build-script `stdout` between `firmware` and `sdmmc_test`; the
+  `-Tlinkall.x` argument only appeared in `firmware`'s own `build.rs`, never in any
+  crate's). Copied `firmware/build.rs` verbatim into `sdmmc_test/`; the very next build
+  placed `esp_app_desc` correctly and produced a properly laid-out binary that flashed
+  and ran.
+- **Verified twice on real hardware with the user's inserted 1GB FAT32 card**: after the
+  fix, the board booted, initialized the SD card over the real SDMMC hardware interface,
+  and correctly waited for a BOOT-button press before doing anything. Two separate
+  button presses (the user pressing BOOT live, Claude watching the serial log) both
+  produced `async FAT CRUD: PASS` -- a genuine create, read-back, update, read-back,
+  delete cycle against the physical card, not a mock or a dry run.
+- **Conclusion: the onboard microSD slot is viable.** An external SPI breakout is not
+  needed. The remaining risk Codex flagged -- that this requires a broad, coherent
+  pin of an entire unreleased `esp-hal` ecosystem, not a safe one-line addition -- is
+  still accurate and still applies to any future work that wires this into `main.rs`;
+  `sdmmc_test/` stays deliberately isolated until/unless that PR merges upstream or a
+  released `esp-hal` version ships this driver.
+- `sdmmc_test/` is currently untracked in git (new crate, not yet committed) --
+  `firmware/`, `server/`, `shared/`, and the root workspace are all confirmed untouched
+  by this experiment (`git status` before and after shows no changes to any of them).
+
 ## Milestone 11 — WiFi connectivity (scan + connect, verified on hardware)
 
 First real step of the WiFi/transport phase: prove the radio and network stack work
@@ -1532,23 +1646,38 @@ correctly, so no wire format or firmware behavior changed -- no hardware reflash
 `event_id`s); that's flagged as an intentional, documented limitation to be addressed
 together with the future persistent offline queue, not patched in isolation now.
 
-**Immediate next step**: a persistent offline queue (onboard microSD) for outages
-longer than the bounded retry window now covers (~10-15s) -- Milestone 16's retries are
-still only in-memory for the lifetime of one event, and `EventDedup` doesn't survive a
-server restart either; both should get durable identity together when that lands. After
-that: battery work (explicitly follows the reliability work, per the user), and
-eventually a real container format for the video part so it doesn't need
-`decode_raw_capture.py`-style parsing to play. The longer-term deployment design is
-still a dedicated IoT network/VLAN that permits only the camera-to-server upload path
-plus TLS; the current shared home subnet + plaintext HTTP is a development setup, not
-the final security boundary -- but the receiver itself has now been through two rounds
-of security review plus a real-media integration pass, two rounds of its own
-post-review hardening, a reliability pass with its own dedup/retry safety net, and a
-fix to that safety net's own correctness, with automated regression coverage
-throughout, and `main.rs` itself has now been proven end-to-end on hardware against a
-real server outage, a real WiFi outage, and a real live disconnect/reconnect.
+**Codex SDMMC research is complete; no longer blocked on research.** A newly opened,
+still-unmerged `esp-hal` PR provides an initial native ESP32-S3 SDMMC host driver and an
+async FAT smoke test using this board's exact built-in slot pins (GPIO38/39/40). Codex
+also proved in an isolated copy that the current complete firmware can compile with
+that driver when the matching `esp-hal` ecosystem is pinned coherently to exact
+revision `cef6d86604d91abcf62afc9804724a637eb7af3a`; patching only the HAL is not
+compatible. See "Future local fallback storage — onboard microSD" above for the full
+sources, API, compatibility experiment, ESP-IDF conclusion, and risk analysis.
+
+**Done: the onboard slot smoke test passed, twice, on real hardware (Claude).** A fully
+isolated `sdmmc_test/` crate (own workspace, not touching `firmware/`) was pinned to the
+exact revision Codex identified and built successfully. The first flash attempt failed
+("appdesc segment not found"); root-caused (by comparing ELF layout against the known-
+working `firmware` binary) to the new crate simply missing the `build.rs` every esp-hal
+app needs, which is what actually supplies the `-Tlinkall.x` linker script -- copying
+`firmware/build.rs` over fixed it immediately. After that, two separate BOOT-button
+presses against the user's real inserted 1GB FAT32 card both produced `async FAT CRUD:
+PASS` (a genuine create/read/update/read/delete cycle, not a mock). See "Future local
+fallback storage — onboard microSD" above for the full account. **The onboard slot is
+viable; no external SPI breakout is needed.**
+
+**Immediate next step**: `sdmmc_test/` is untracked and not yet committed -- decide
+whether/when to commit it (it's a working, isolated experiment, not integrated into
+`main.rs`). Then continue the recommended order: save-on-failure (queue an event as an
+envelope file on the card when upload fails) -> scan/retry queued events after reboot or
+connectivity recovery -> delete only after a confirmed `200` -> persistent server-side
+dedup keyed on `event_id` (the current `EventDedup` is RAM-only and forgets everything on
+a server restart, exactly the gap a persistent queue needs to close) -> hardware tests
+for WiFi outage, server outage, and a real ESP32 power-cycle during an outage. Battery
+work remains parked until that offline-queue testing succeeds, per the user.
 
 Also still open, lower priority: trawling GitHub issues/forums/Reddit/Discord for
 OV3660-specific community register tweaks for image quality (see "Image quality
 investigation" above, point 7) — deliberately not fabricated here since there's no live
-access to those discussions in this session. Nothing is currently blocked.
+access to those discussions in this session.

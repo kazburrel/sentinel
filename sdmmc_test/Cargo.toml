@@ -1,0 +1,71 @@
+[workspace]
+
+[package]
+name = "sdmmc_test"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "sdmmc_test"
+path = "src/main.rs"
+
+# Pinned to an exact, unreleased revision of an open upstream esp-hal PR
+# (esp-rs/esp-hal#5760, "SDMMC/SDIO host", branch bugadani/esp-hal:sdmmc) that
+# is the only current way to drive this board's onboard microSD slot -- no
+# released esp-hal version has an SDMMC/SDIO driver at all. Deliberately kept
+# in this fully separate crate (own workspace, own Cargo.lock) rather than
+# added to `firmware/`'s Cargo.toml, so this experimental dependency set
+# can't destabilize the camera/WiFi firmware even if it turns out broken.
+# See PROJECT_STATUS.md's "Future local fallback storage" section.
+[dependencies]
+embassy-executor = "0.10.0"
+embassy-futures = "0.1"
+embassy-time = "0.5.0"
+embedded-io-async = "0.7.0"
+esp-backtrace = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-backtrace", features = [
+  "esp32s3",
+  "panic-handler",
+  "println",
+] }
+esp-bootloader-esp-idf = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-bootloader-esp-idf", features = [
+  "esp32s3",
+] }
+esp-hal = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-hal", features = [
+  "esp32s3",
+  "unstable",
+  "log-04",
+] }
+esp-rtos = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-rtos", features = [
+  "esp32s3",
+  "embassy",
+  "log-04",
+] }
+esp-println = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-println", default-features = false, features = [
+  "esp32s3",
+  "jtag-serial",
+  "critical-section",
+  "log-04",
+] }
+static_cell = "2.1.1"
+sdio = "0.4"
+block-device-adapters = "0.2.0"
+embedded-fatfs = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112", default-features = false }
+embedded-partitions = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }
+log = "0.4"
+
+# The published block-device-adapters/block-device-driver don't yet have the
+# compatibility this SDMMC branch needs -- same patch the upstream qa-test
+# crate itself uses, redirecting to the matching embedded-fatfs fork revision.
+[patch.crates-io]
+block-device-driver = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }
+block-device-adapters = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug         = 2
+lto           = "fat"
+opt-level     = "s"
