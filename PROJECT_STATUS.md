@@ -900,23 +900,227 @@ a trusted development LAN," not "fully hardened."
   (`http_post_test.rs`) kept succeeding throughout. Test artifacts from this
   verification pass were deleted afterward.
 
+Milestones 11-13 are now **committed** (`377f260`), along with `DEPLOYMENT.md`; secrets
+(`firmware/src/wifi_credentials.rs`, `server/src/config.rs`) and `NEXT_STEP.md` stayed
+untracked as intended.
+
+## Milestone 14 — real event data: shared envelope, thumbnail, then video (verified on hardware)
+
+Replaced the placeholder text body with real captured media, using a small hand-rolled
+wire format instead of a serde/postcard dependency (firmware is `no_std` with only a
+tiny on-chip heap; the format only ever needs to describe "how many bytes, what kind"
+around data that already lives in a buffer -- no owned allocation needed on either
+side).
+
+- **`shared` crate now defines the event envelope** (`shared/src/lib.rs`, replacing the
+  untouched `add()` stub): a 6-byte header (`CAM1` magic + version + part count)
+  followed by one or more parts, each a 5-byte header (kind byte + little-endian u32
+  length) plus that many raw payload bytes. `PartKind` is `Thumbnail`/`Video`/`Audio`
+  (audio reserved, unused). Encode side returns fixed-size arrays (no allocation, so
+  firmware can write header bytes then stream the payload straight from its existing
+  capture/PSRAM buffer without ever copying the whole event into one contiguous
+  buffer). Decode side (`decode_envelope_header` + `PartsIter`) borrows from the
+  caller's byte slice throughout -- also no allocation, works the same whether the
+  caller then copies each part into a file (the `server` crate) or just inspects it.
+  7 `#[cfg(test)]` unit tests cover round-tripping one part, round-tripping two parts,
+  and every error case (bad magic, unsupported version, truncated header, unknown part
+  kind, part length exceeding the buffer). All pass (`cargo test -p shared`).
+- **`firmware/src/bin/event_upload_test.rs`, new**: WiFi connect (same as
+  `http_post_test.rs`) + real `CameraHandle::capture_jpeg` (same pin wiring as
+  `camera_test.rs`), wraps the captured JPEG as a single `Thumbnail` part, and POSTs it
+  to the hardened `server` receiver. **Verified on real hardware**: captured real
+  640x480 JPEGs (~10.6KB each), got `200 OK` responses, and the server stored each as
+  its own `.jpg` file that `file`/`sips` confirm is a valid, correctly-decoded JPEG (one
+  frame opened and visually confirmed -- a real photo of a lamp fixture, not corrupt
+  data).
+- **`server/src/main.rs` storage rebuilt around the envelope**: `store_upload()`
+  (single raw-bytes-to-one-file) replaced by `store_event()` + `create_event_part_file()`
+  -- parses the envelope, then writes each part to its own
+  `event_<timestamp>_<label>.<ext>` file (`.jpg` for thumbnails; `.bin` for
+  video/audio until a container format is chosen), sharing one timestamp per event so
+  parts sort together, with the same collision-safe `create_new(true)`-plus-retry-suffix
+  scheme Milestone 13 established. Malformed envelopes map to `RequestError::InvalidEnvelope`
+  -> `400 Bad Request`. 3 new `#[cfg(test)]` unit tests (single-part storage incl.
+  content-equality, two-part storage with distinct filenames/extensions, malformed-body
+  rejection) run against a scratch temp directory, not the real `UPLOADS_DIR`
+  (`store_event`/`create_event_part_file` now take `dir` as a parameter specifically so
+  tests don't touch real uploads). All pass (`cargo test -p server`, 7 total including
+  Milestone 13's).
+- **Verified end-to-end with a real JPEG before touching hardware**: built an envelope
+  body from a real JPEG in Python, POSTed it via `curl` to a locally running server,
+  confirmed the stored file was byte-identical to the source and opened correctly --
+  caught any integration mistakes before involving the board at all.
+- **`firmware/src/bin/event_upload_video_test.rs`, new**: adds a recorded video clip
+  alongside the thumbnail. Captures one still JPEG, then records a fixed 5-second burst
+  straight into PSRAM via the existing `PsramRecorder` (same approach as
+  `psram_record_test.rs`), and uploads both as a two-part envelope (`Thumbnail` +
+  `Video`) in one HTTP POST. The video part's payload is
+  `PsramRecorder::recorded_bytes()` verbatim -- the same `[frame_len: u32 LE]
+  [timestamp_ms: u32 LE][JPEG bytes]` per-frame format `scripts/decode_raw_capture.py`
+  already parses, just delivered over WiFi instead of serial, so no new decode logic
+  was needed. **Verified on real hardware**: 3 consecutive events, each 70 frames
+  (~747KB) recorded at the expected ~13.9 FPS (matching Milestone 7's measured PSRAM
+  copy overhead) plus a ~10.6KB thumbnail, all `200 OK`, both parts stored under a
+  shared timestamp. Decoded the video part with `decode_raw_capture.py` (wrapped in the
+  `RAW EXPORT BEGIN <n>` marker it expects, since that script was written for a serial
+  log, not a bare file -- no script changes needed) -- all 70 frames extracted cleanly,
+  no truncation warnings, assembled into a real H.264 `.mp4` via `ffmpeg` (confirmed via
+  `ffprobe`: 640x480, 70 frames, ~5.04s) and one frame opened and visually confirmed as
+  a real photo, not corrupt data. Test uploads and decoded artifacts were deleted
+  afterward.
+- `firmware/Cargo.toml` — `[[bin]]` entries added for both new binaries.
+
+Both new firmware binaries are standalone test binaries (matching this project's
+established pattern of proving each new subsystem in isolation before wiring it into
+`main.rs`) -- `main.rs` itself is untouched; replacing its wired USB delivery path with
+WiFi is still a separate, later step (see Next steps).
+
+### Post-review hardening before `main.rs` integration (envelope bumped to v2)
+
+A review of Milestone 14 (before it touched `main.rs`) found four real gaps -- fixed,
+tested, and **re-verified on real hardware** (both `event_upload_test.rs` and
+`event_upload_video_test.rs` re-flashed and re-run end-to-end, since the wire format
+itself changed):
+
+- **Strict parsing, fixed**: a zero-part envelope is now rejected
+  (`EnvelopeError::EmptyEvent`) instead of silently accepted, and undeclared trailing
+  bytes after the last declared part are now rejected too (`EnvelopeError::TrailingBytes`)
+  instead of silently ignored -- `PartsIter` reports this the moment all declared parts
+  are consumed but bytes remain. Both are covered by new `shared` unit tests.
+- **Transactional storage, fixed**: `store_event()` now parses (and thus fully
+  validates) every part *before* writing anything -- a malformed part N can no longer
+  leave parts 1..N-1 on disk as an orphaned partial event, since nothing is written
+  until the whole envelope has already parsed successfully. Storage itself
+  (`commit_part_file()`, replacing `create_event_part_file()`) now writes to a private
+  temp file first, then commits to the collision-safe final name via `hard_link` rather
+  than `rename` -- `rename` silently replaces an existing destination on POSIX, so it
+  can't actually detect a collision on the final name once an earlier event's temp file
+  has been cleaned up; `hard_link` fails instead, which is what the retry-on-collision
+  logic actually needs. If a part still fails to store after parsing succeeded (real
+  disk/permission failure), every part already committed for that event is deleted
+  before the error is returned, so no partial event is ever left visible under real
+  filenames. Verified with a new test that makes the uploads directory read-only
+  mid-test and confirms zero files remain afterward.
+- **Richer part metadata, envelope bumped to v2**: added a firmware-assigned `event_id`
+  (`u64`, a per-boot-session monotonic counter for now -- no RTC on this board) to the
+  envelope header, and `encoding`/`timestamp_ms`/`duration_ms` to each part header
+  (`PART_HEADER_LEN` 5 -> 14 bytes). `Encoding` is a closed enum like `PartKind`
+  (`Jpeg`, `RecorderFrames`, `Pcm16Mono` reserved for the future audio part) --
+  `timestamp_ms`/`duration_ms` let the video part declare its own start-offset and
+  length relative to the event without a downstream consumer having to parse the whole
+  frame blob just to find out. This was deliberately done as a version bump (`VERSION`
+  1 -> 2, replacing v1 outright) rather than added compatibly, since v1 never shipped
+  anywhere outside this session's own test binaries -- no deployed consumer to stay
+  compatible with.
+- **Correct status codes, fixed**: added `RequestError::StorageFailure(std::io::Error)`,
+  mapped to `500 Internal Server Error`, distinct from the pre-existing `Io` variant
+  (still `400`, for TCP/connection-level failures). Previously, `store_event`'s
+  filesystem calls used the blanket `From<io::Error>` conversion into `Io`, so a real
+  disk/permission failure on a perfectly valid request was indistinguishable from a
+  malformed request -- both returned `400`. Now a valid event that fails to persist
+  returns `500`, telling firmware the request was fine and retrying makes sense.
+- `shared` now has 10 unit tests (up from 7), `server` has 10 (up from 7); all pass
+  (`cargo test -p shared -p server`).
+- **Re-verified end-to-end on hardware** after all of the above: `event_upload_test.rs`
+  re-flashed, captured real JPEGs, server logged each part's
+  kind/encoding/timestamp_ms/duration_ms and stored a valid `.jpg` (confirmed via
+  `file`). `event_upload_video_test.rs` re-flashed, produced 3 events (70 frames each,
+  ~2MB clips this time -- a more detailed scene than the first pass, not a regression),
+  video part's logged `timestamp_ms`/`duration_ms` matched the real measured
+  capture-to-record-start gap (~134-146ms) and recording length (~5043-5044ms); decoded
+  one clip with `decode_raw_capture.py` (all 70 frames, no truncation warnings) and
+  visually confirmed a real frame. No `.tmp` files left behind after successful
+  commits. Test uploads deleted afterward.
+
+### Second review: the "no partial event" guarantee wasn't actually true yet
+
+A follow-up review of the hardening above found the transactional-storage claim didn't
+fully hold up -- three real gaps in `commit_part_file`/`store_event`, plus two
+lower-priority protocol gaps, all fixed and tested:
+
+- **Temp file leaked on write/sync failure, fixed**: if `write_all` or `sync_all` on
+  the temp file failed, `commit_part_file` returned early via `?` without removing the
+  temp file it had just created -- a real (if rare) leftover. Now both are attempted
+  together and any failure explicitly removes the temp file before returning the error.
+- **A committed part could escape rollback, fixed**: after `hard_link` successfully
+  exposed a part under its final name, a *subsequent* failure removing the
+  now-redundant temp file was propagated as `commit_part_file`'s own error --
+  incorrectly, since the event's data was already fully durable and visible under the
+  final name at that point. That mistaken error meant `store_event` never added the
+  filename to its rollback-tracking list, so a later part's real failure would roll back
+  *other* parts but never this one -- an orphaned file outside the rollback mechanism's
+  visibility entirely. Fixed: `commit_part_file` now always returns `Ok(final_path)`
+  once `hard_link` succeeds; a failure removing the temp file is only logged as a
+  warning, never turned into a reported failure.
+- **`flush()` doesn't mean durable, fixed**: `std::fs::File::flush()` is a no-op (no
+  internal buffering to flush) -- it does not force the OS to write data to disk.
+  Replaced with `sync_all()` (an actual `fsync`), called before the payload is ever
+  exposed under a final name, so a part is genuinely durable against a crash or power
+  loss by the time it's visible, not just "written" in a sense that doesn't survive a
+  crash.
+- **Real fault-injection tests for first/second-part failure, added**: the previous
+  rollback test could only force a failure *before* the first part was ever written
+  (a real directory-wide permission failure), so it never actually exercised "an
+  earlier part already committed, a later one fails, the earlier one gets rolled back."
+  Fixed by extracting `store_event_with_committer` (the real `store_event` delegates to
+  it, passing `commit_part_file`) so tests can inject a fake committer -- one new test
+  makes the *first* part's commit fail (asserts nothing gets written), another makes the
+  *second* part's commit fail after letting the first genuinely commit (asserts the
+  first part's real file gets rolled back). The original real-permission test is kept
+  alongside these, since it exercises genuine OS-level I/O failure rather than a
+  simulated one.
+- **Kind/encoding mismatch, fixed (lower priority, done anyway)**: `Thumbnail` +
+  `Pcm16Mono` (individually valid values, nonsensical pairing) was previously accepted
+  and would have been stored and trusted downstream. Added
+  `EnvelopeError::InvalidEncodingForKind`, checked against an explicit whitelist of
+  currently-valid `(kind, encoding)` pairs in `shared`'s `PartsIter` -- a whitelist
+  rather than a strict 1:1 mapping, so a kind can gain a second valid encoding later
+  (e.g. a real video container) without another wire version bump.
+- **`event_id` reuse across reboots (lower priority, not fixed)**: still a per-boot
+  monotonic counter, so it can repeat after a reboot and isn't used for deduplication.
+  Now at least logged per event (`event_id=N` in the `store_event` part log) for
+  traceability. Real dedup/idempotency is deferred to the retry-semantics work in Next
+  steps, where it's actually needed.
+- `shared` now has 11 unit tests (up from 10), `server` has 12 (up from 10); all pass
+  (`cargo test -p shared -p server`).
+- **Live-verified against the real running server binary** (not just `cargo test`): a
+  valid v2 envelope -> `200 OK`, stored and readable; a `Thumbnail`+`Pcm16Mono`
+  mismatch -> `400 Bad Request`, logged as `InvalidEncodingForKind`. This round's fixes
+  don't change the wire byte layout (only add server-side validation of already-valid
+  field values), and real firmware never sends an invalid pairing, so a full hardware
+  reflash wasn't required this time -- unlike the v1->v2 bump above, which changed every
+  message's byte layout and did need it. `firmware` was still rebuilt (`cargo build
+  --release`) to confirm it compiles clean against the updated `shared` crate. Test
+  artifacts deleted afterward.
+
+**`main.rs` integration is still the next step, not yet started** -- both hardening
+passes above were explicitly prerequisites for it, not the integration itself.
+
 ## Next steps (not yet started)
 
-- **Wire real camera/event data into the minimally hardened trusted-LAN HTTP path**
-  instead of the placeholder text body -- send an actual captured JPEG or
-  PSRAM-recorded clip's bytes, now that WiFi connectivity (Milestone 11), basic POST
-  (Milestone 12), and two rounds of receiver hardening (Milestone 13) are all
-  independently proven.
-- Build out the `server` crate beyond the minimal receiver: real request routing and
-  structured event storage (currently just raw bytes to a timestamped file) instead of
-  an undifferentiated blob.
+- **Audio part, optional, later.** `PartKind::Audio` already exists in the envelope
+  (reserved, unused) -- add it only once there's an actual audio source to capture;
+  the wire format and server storage path need no changes to support it when that
+  happens.
+- **Replace the wired delivery path with WiFi** in `main.rs` itself now that real event
+  data (thumbnail + video) is proven flowing over HTTP end-to-end on hardware
+  (Milestone 14) -- the current ESP32 -> USB serial -> Mac script path already exports
+  recordings and produces playable video; preserve it as a debugging/fallback path
+  while adding ESP32 -> WiFi -> Mac server delivery driven by the real PIR-triggered
+  event state machine (`main.rs`'s doorbell-style logic from Milestones 9-10), not a
+  fixed-duration test loop like `event_upload_video_test.rs`.
+- Build out the `server` crate's request routing beyond the single `POST /upload`
+  endpoint (structured per-part storage is now done, per Milestone 14) once there's an
+  actual second concern to route to (e.g. an AI-processing trigger or a query endpoint).
 - Define richer acknowledgement/retry semantics for wireless uploads (the receiver
   already returns correct HTTP status codes; the firmware side doesn't yet act on
-  failure beyond printing it).
-- **Replace the wired delivery path with WiFi** in `main.rs` itself once real
-  event data is flowing over HTTP -- the current ESP32 -> USB serial -> Mac script
-  path already exports recordings and produces playable video; preserve it as a
-  debugging/fallback path while adding ESP32 -> WiFi -> Mac server delivery.
+  failure beyond printing it) -- more pressing once `main.rs` depends on delivery
+  actually succeeding, rather than a test binary that just logs and retries next loop.
+- Decide a real container format for the video part once it's time to make clips
+  independently playable server-side without a decode script (currently `.bin`,
+  requiring `decode_raw_capture.py`-style parsing) -- e.g. actual MJPEG/AVI muxing, or
+  running the existing ffmpeg assembly step directly in the `server` crate after
+  storage.
 - Optionally investigate the FPS gap noted in Milestone 7 (PSRAM copy overhead: ~12-14
   FPS vs. Milestone 6's 20.06 FPS) if smoother recorded video is wanted.
 - Act on the image-quality findings from the investigation above once a sample image is
@@ -924,9 +1128,6 @@ a trusted development LAN," not "fully hardened."
   JPEG quality — all cheap, safe, no code written yet pending user direction.
 - Optionally hand the community/undocumented-tricks research (image quality
   investigation, point 7) to Codex.
-- Once HTTP POST + server are proven, replace the untouched `shared` crate stub with
-  the extensible event envelope described above (thumbnail/video now, optional audio
-  later). AI processing and phone notifications remain later milestones.
 - **Later: onboard microSD offline queue/fallback.** After WiFi upload and server
   acknowledgement are reliable, test the user's 1GB FAT32 card through the built-in
   1-bit SDMMC slot (GPIO38/39/40), then add save-on-upload-failure and delete-on-ack
@@ -947,28 +1148,44 @@ into `main.rs` with strict JPEG validation (Milestones 9-10), workspace structur
 the working tree at commit time, so recording is currently off; flip to `true` and
 reflash to re-enable motion-triggered recording.
 
-**Uncommitted, current** (Milestones 11-13, described above):
-- `firmware/src/bin/wifi_scan_test.rs` — new, standalone WiFi network scanner
-- `firmware/src/bin/wifi_test.rs` — new, WiFi STA connection + DHCP test
-- `firmware/src/bin/http_post_test.rs` — new, WiFi + hardened HTTP POST (sends
-  `X-Upload-Token`) to the `server` crate, verified round trip on hardware
-- `firmware/Cargo.toml` — `[[bin]]` entries for all three
-- `.gitignore` — excludes `firmware/src/wifi_credentials.rs`, `server/src/config.rs`,
-  `server/uploads/`
-- `firmware/src/wifi_credentials.rs.example` — committed template (real credentials
-  file itself is gitignored, confirmed via `git check-ignore -v`); includes
-  `SERVER_IP`/`SERVER_PORT`/`UPLOAD_TOKEN`
-- `server/src/main.rs` — replaced `Hello, world!` scaffolding with a hardened HTTP
-  receiver: auth token, bounded header/body sizes, read timeout, exact-body
-  validation, correct per-failure HTTP status codes (plain `std`, no new
-  dependencies); first-review fixes (strict header size boundary, generic `404` for
-  unknown route/missing/wrong token); second-review fixes (`read_headers()` measures
-  the header's own length not total buffer, now generic over `Read` for testability;
-  `store_upload()` uses `create_new(true)` with a retry suffix for collision-safe
-  filenames); 4 `#[cfg(test)]` unit tests covering the header-boundary logic
-  (`cargo test -p server`)
-- `server/src/config.rs` — new, gitignored, holds the real `UPLOAD_TOKEN`
-- `server/src/config.rs.example` — new, committed template
+**Committed** (`377f260`, Milestones 11-13): WiFi scan/connect (`wifi_scan_test.rs`,
+`wifi_test.rs`), hardened HTTP POST receiver (`server/src/main.rs`) with auth token,
+bounded header/body sizes, read timeout, exact-body validation, collision-safe
+filenames, generic `404`s, and both rounds of post-review fixes; `http_post_test.rs`;
+gitignored-credential templates; `DEPLOYMENT.md`.
+
+**Uncommitted, current** (Milestone 14, v2 envelope after post-review hardening,
+described above):
+- `shared/src/lib.rs` — the event envelope, v2: `MAGIC`/`VERSION` constants,
+  `PartKind`/`Encoding`/`EnvelopeError` enums, `encode_envelope_header` (now takes
+  `event_id: u64`) / `encode_part_header` (now takes `encoding`/`timestamp_ms`/
+  `duration_ms`) (fixed-size arrays, no allocation), `decode_envelope_header`/
+  `PartsIter` (borrow from caller's slice, no allocation; strictly rejects zero-part
+  envelopes, undeclared trailing bytes, and kind/encoding mismatches via an explicit
+  whitelist). 11 `#[cfg(test)]` unit tests.
+- `firmware/src/bin/event_upload_test.rs` — new, WiFi + real camera capture, uploads
+  one `Thumbnail` part, verified on hardware (real JPEGs stored and opened correctly),
+  re-verified again after the v2 bump.
+- `firmware/src/bin/event_upload_video_test.rs` — new, WiFi + thumbnail capture + 5s
+  PSRAM-recorded burst, uploads both as a two-part envelope with real
+  `timestamp_ms`/`duration_ms` per part, verified on hardware (70-frame clips decoded
+  and assembled into playable `.mp4`), re-verified again after the v2 bump.
+- `firmware/Cargo.toml` — `[[bin]]` entries for both new binaries.
+- `server/src/main.rs` — `store_upload()` (single raw-bytes file) replaced by
+  `store_event()` (delegates to `store_event_with_committer()`, added for fault-injection
+  testability) + `commit_part_file()`: parses (and fully validates) the whole envelope
+  before writing anything, then writes each part to a private temp file (`sync_all`,
+  not just `flush`, for real durability), committing it to its final
+  `event_<timestamp>_<label>.<ext>` name via `hard_link` (collision-safe and
+  rollback-safe, not `rename` -- see the post-review subsections above for why, including
+  the fix for a committed part being able to escape rollback bookkeeping if temp-file
+  cleanup failed afterward); malformed envelopes -> `RequestError::InvalidEnvelope` ->
+  `400`; storage-layer I/O failures -> `RequestError::StorageFailure` -> `500`, distinct
+  from connection-layer `Io` -> `400`. Both storage functions take `dir` as a parameter
+  (not hardcoded to `UPLOADS_DIR`) so tests use a scratch temp directory. 12
+  `#[cfg(test)]` unit tests total (`cargo test -p server`), including two
+  fault-injection tests pinning down exactly which part fails and which files get
+  rolled back.
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
@@ -999,34 +1216,46 @@ reflash to re-enable motion-triggered recording.
 ## What's needed from Codex right now
 
 Nothing blocking — **the entire camera phase (Milestones 1-10) is complete and
-committed**, and **the WiFi/transport foundation (Milestones 11-13) is verified on
-hardware end-to-end, including security hardening and BOTH rounds of post-review
-follow-up fixes**: the board scans real nearby networks, connects to the user's actual
-WiFi, gets a stable DHCP IP, and sends authenticated HTTP uploads (`X-Upload-Token`) to
-a receiver that enforces a *strictly* bounded header size (measured against the
-header's own length, not the total buffer, so a body coalesced into the same TCP read
-can't trigger a false rejection), a bounded body size, a read timeout, exact
-body-length validation, collision-safe server-chosen storage filenames
-(`create_new(true)` with a retry suffix), and returns an identical generic `404` for
-unknown routes, missing tokens, and wrong tokens (verified with `curl`: all three
-byte-for-byte identical, distinct from the `200 OK` success case). The header-boundary
-logic now also has 4 automated `#[cfg(test)]` unit tests (`cargo test -p server`)
-covering exact-limit, over-limit, coalesced-body, and missing-terminator cases, so
-future changes don't need hand-verification every time. Every API and fix was
-grounded/verified against real source or real behavior before being trusted, same
-discipline throughout: two real bugs in Milestone 12/13 (malformed `Host` header, a
-relative storage path), and each review pass caught real bugs in the previous
-"hardened" code (header-limit-bypass, then header-length miscounting, missing tests,
-and a filename-collision risk) before any real camera data touched it.
+committed**, **the WiFi/transport foundation (Milestones 11-13) is committed
+(`377f260`) and verified on hardware end-to-end**, and **real event data (Milestone 14)
+is now flowing over that path, also verified on hardware, including two rounds of
+post-review hardening** (strict envelope parsing including kind/encoding validation,
+genuinely transactional hard-link-based storage with real fault-injection test
+coverage, `sync_all`-based durability instead of a no-op `flush`, richer per-part
+metadata via a v2 wire-format bump, and correct `500`-vs-`400` status codes -- see both
+post-review subsections above): the board captures a real JPEG thumbnail and a real
+5-second PSRAM-recorded video clip, wraps both in the `shared` crate event envelope
+(v2), and uploads them together to the hardened receiver, which fully validates the
+envelope before writing anything and stores each part atomically -- including correctly
+rolling back an already-committed earlier part if a later part fails, now proven by a
+test that forces exactly that sequence via an injectable committer, not just "some
+failure leaves nothing behind." The thumbnail opens correctly as a JPEG; the video part
+decodes cleanly into 70 frames and assembles into a real, playable H.264 clip via
+`ffmpeg` -- confirmed with `ffprobe` and by visually opening a frame, not just checking
+exit codes. The envelope format has 11 unit tests (`shared`) and the storage path has
+12 more (`server`), all passing. Both firmware test binaries were re-flashed and
+re-verified on hardware after the v2 wire-format bump specifically; the second
+hardening round's fixes don't change the wire byte layout, so that round was
+live-verified against the real running server binary via `curl` instead (a valid
+envelope stored correctly, a kind/encoding mismatch correctly rejected) plus a firmware
+rebuild to confirm no compile breakage, rather than a full hardware reflash.
 
-**Immediate next step**: wire actual camera/event data into the now-twice-hardened
-trusted-LAN HTTP path and build the extensible shared payload envelope (thumbnail/video
-now, optional audio later). The longer-term deployment design is still a dedicated IoT
-network/VLAN that permits only the camera-to-server upload path plus TLS; the current
-shared home subnet + plaintext HTTP is a development setup, not the final security
-boundary -- but the receiver itself has now been through two rounds of review and
-hardening, not just one, with automated regression coverage for the trickiest part of
-its parsing logic.
+**Immediate next step**: replace `main.rs`'s wired USB delivery path with WiFi, driven
+by the real PIR-triggered doorbell-style event state machine (Milestones 9-10) instead
+of `event_upload_video_test.rs`'s fixed-duration test loop -- that's the last piece
+connecting a real motion event to a real upload, end to end, unattended. This was
+explicitly deferred until both hardening passes above landed and were verified, so it's
+ready to start now. After that: richer delivery acknowledgement/retry semantics (the
+`500` vs `400` distinction, and the now-logged-but-not-yet-deduplicated `event_id`, are
+exactly what those retries will need to key off), and eventually a real container
+format for the video part so it doesn't need `decode_raw_capture.py`-style parsing to
+play. The longer-term deployment design is still a dedicated IoT network/VLAN that
+permits only the camera-to-server upload path plus TLS; the current shared home subnet
++ plaintext HTTP is a development setup, not the final security boundary -- but the
+receiver itself has now been through two rounds of security review plus a real-media
+integration pass and two rounds of its own post-review hardening, with automated
+regression coverage throughout, including fault-injection tests for the exact failure
+sequences that matter.
 
 Also still open, lower priority: trawling GitHub issues/forums/Reddit/Discord for
 OV3660-specific community register tweaks for image quality (see "Image quality

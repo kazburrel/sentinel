@@ -54,6 +54,14 @@ path = "./src/bin/wifi_scan_test.rs"
 name = "http_post_test"
 path = "./src/bin/http_post_test.rs"
 
+[[bin]]
+name = "event_upload_test"
+path = "./src/bin/event_upload_test.rs"
+
+[[bin]]
+name = "event_upload_video_test"
+path = "./src/bin/event_upload_video_test.rs"
+
 [dependencies]
 shared = { path = "../shared" }
 

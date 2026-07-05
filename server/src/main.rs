@@ -1,12 +1,18 @@
 //! Minimal-but-safe HTTP receiver for the ESP32 -> WiFi -> Mac upload path.
 //!
-//! Milestone 12 proved the pipe works at all; this hardens it per the
-//! project's security review before any real camera footage gets wired in:
-//! auth token, bounded header/body sizes, a read timeout, exact-body
+//! Milestone 12 proved the pipe works at all; Milestone 13 hardened it per
+//! the project's security review before any real camera footage got wired
+//! in: auth token, bounded header/body sizes, a read timeout, exact-body
 //! validation (no 200 on a truncated upload), and safe server-chosen
 //! filenames under one dedicated storage directory -- never a
 //! client-supplied path. Still deliberately not a real router/framework;
 //! just `POST /upload` with a token, nothing else.
+//!
+//! Milestone 14 replaced the raw-bytes-to-one-file storage with the
+//! `shared` crate's event envelope: the body is now a small header
+//! followed by one or more named, typed parts (thumbnail JPEG now,
+//! recorded video later, audio optional after that), each written to its
+//! own file under `UPLOADS_DIR`.
 //!
 //! Only acceptable on a trusted LAN during development -- see
 //! `PROJECT_STATUS.md`'s security threat model for what's still needed
@@ -18,6 +24,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use shared::{decode_envelope_header, EnvelopeError, PartHeader, PartKind, PartsIter};
 
 const PORT: u16 = 8080;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,6 +54,18 @@ enum RequestError {
     BodyTooLarge,
     Unauthorized,
     BodyTruncated,
+    /// Same dead-code-lint caveat as `Io` above: read via `Debug` in the
+    /// `println!` log line and in test assertions, neither of which the
+    /// lint credits as a use.
+    #[allow(dead_code)]
+    InvalidEnvelope(EnvelopeError),
+    /// A storage-layer I/O failure (disk full, permissions, etc.) --
+    /// deliberately distinct from `Io` (TCP/connection failures) so it maps
+    /// to `500`, not `400`: the request itself was a perfectly valid event,
+    /// the server just failed to persist it, so firmware should treat this
+    /// as retryable rather than as its own fault.
+    #[allow(dead_code)]
+    StorageFailure(std::io::Error),
 }
 
 impl From<std::io::Error> for RequestError {
@@ -68,7 +88,8 @@ impl RequestError {
             RequestError::HeadersTooLarge => "HTTP/1.1 431 Request Header Fields Too Large",
             RequestError::MissingContentLength => "HTTP/1.1 411 Length Required",
             RequestError::BodyTooLarge => "HTTP/1.1 413 Payload Too Large",
-            RequestError::BodyTruncated => "HTTP/1.1 400 Bad Request",
+            RequestError::BodyTruncated | RequestError::InvalidEnvelope(_) => "HTTP/1.1 400 Bad Request",
+            RequestError::StorageFailure(_) => "HTTP/1.1 500 Internal Server Error",
         }
     }
 }
@@ -139,40 +160,162 @@ fn read_exact_body(
     Ok(buf.split_off(headers_end))
 }
 
-/// Writes `body` under `UPLOADS_DIR` with a server-chosen filename,
-/// guaranteed never to silently overwrite an existing file. A plain
-/// `upload_<unix_millis>.bin` name isn't collision-proof on its own --
-/// two uploads landing in the same millisecond would otherwise clobber each
-/// other. `create_new(true)` atomically fails if the target already exists,
-/// so on collision we just try the next suffix instead.
-fn store_upload(body: &[u8]) -> std::io::Result<String> {
-    fs::create_dir_all(UPLOADS_DIR)?;
+/// Writes `payload` to a private temp file, then atomically "commits" it to
+/// a collision-safe final name (`event_<unix_millis>_<label>.<ext>`, or with
+/// a `_<N>` suffix on collision) via `hard_link` rather than `rename`.
+///
+/// This distinction matters: `rename` on POSIX silently replaces an
+/// existing destination, so retrying it on a "taken" name can't detect the
+/// collision at all. `hard_link` fails with `AlreadyExists` instead, which
+/// is what actually lets us retry with the next suffix safely -- including
+/// long after an earlier event's temp file for the same millisecond+label
+/// has already been cleaned up (so re-trying `create_new` on a *new* temp
+/// name would never notice the final name was taken).
+///
+/// `sync_all` (not `flush`, which is a no-op for `std::fs::File` -- it does
+/// not force the OS to write data to disk) is called before the payload is
+/// ever exposed under a final name, so `payload` is actually durable against
+/// a crash or power loss by the time a reader could observe it.
+///
+/// Once `hard_link` succeeds, `payload` is fully written and durable under
+/// `final_path` -- that return value is the function's actual success
+/// signal. Everything after it (removing the now-redundant temp name) is
+/// just tidiness: if it fails, the temp file is harmless untracked litter,
+/// not a correctness problem, so it must not turn a real success into a
+/// reported failure (which would hide the committed file from
+/// `store_event`'s rollback bookkeeping -- a partial event that survives
+/// forever instead of one that gets cleanly rolled back).
+fn commit_part_file(
+    dir: &str,
+    timestamp: u128,
+    label: &str,
+    ext: &str,
+    payload: &[u8],
+) -> std::io::Result<String> {
+    let mut tmp_suffix = 0u32;
+    let (tmp_path, mut tmp_file) = loop {
+        let candidate = format!("{dir}/.tmp_{timestamp}_{label}_{tmp_suffix}");
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                tmp_suffix += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    if let Err(e) = tmp_file.write_all(payload).and_then(|()| tmp_file.sync_all()) {
+        drop(tmp_file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    drop(tmp_file);
+
+    let mut final_suffix = 0u32;
+    let final_path = loop {
+        let candidate = if final_suffix == 0 {
+            format!("{dir}/event_{timestamp}_{label}.{ext}")
+        } else {
+            format!("{dir}/event_{timestamp}_{label}_{final_suffix}.{ext}")
+        };
+        match fs::hard_link(&tmp_path, &candidate) {
+            Ok(()) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                final_suffix += 1;
+                continue;
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
+    };
+
+    // The event is already fully durable and visible under `final_path` at
+    // this point -- a failure removing the leftover temp name must not be
+    // reported as this call failing.
+    if let Err(e) = fs::remove_file(&tmp_path) {
+        println!("warning: committed {final_path} but failed to remove temp file {tmp_path}: {e}");
+    }
+    Ok(final_path)
+}
+
+/// The on-disk label and file extension for a given part kind. Thumbnail
+/// parts are real JPEG bytes, so `.jpg` makes them directly openable;
+/// video/audio containers aren't decided yet (see `PROJECT_STATUS.md`), so
+/// they land as `.bin` until that's designed.
+fn part_file_naming(kind: PartKind) -> (&'static str, &'static str) {
+    match kind {
+        PartKind::Thumbnail => ("thumbnail", "jpg"),
+        PartKind::Video => ("video", "bin"),
+        PartKind::Audio => ("audio", "bin"),
+    }
+}
+
+/// Parses the `shared` crate's event envelope out of `body` and writes each
+/// part to its own file under `dir` via `committer`, all sharing one
+/// timestamp so parts from the same event sort together. Returns the stored
+/// filenames in part order, for logging.
+///
+/// The whole envelope is parsed -- and thus fully validated -- before
+/// anything is written to disk, so a malformed part N can never leave parts
+/// 1..N-1 behind as an orphaned partial event. If a part still fails to
+/// *store* after that (disk full, permissions, ...), every part already
+/// committed for this event is rolled back before returning the error, so
+/// callers never observe a partial event under real filenames either way.
+///
+/// `committer` is a parameter (rather than calling `commit_part_file`
+/// directly) purely for testability: real storage failures only manifest
+/// deterministically at the directory level (permissions, quota), which
+/// can't be scoped to "only the second part" from outside this function --
+/// any pre-existing file/dir at a candidate path is, correctly, just
+/// treated as a name collision and retried, not a hard failure. Injecting a
+/// fake committer lets tests simulate "part N specifically fails" to verify
+/// the rollback logic actually rolls back the *right* parts, not just that
+/// zero-vs-nonzero parts got written.
+fn store_event_with_committer(
+    dir: &str,
+    body: &[u8],
+    mut committer: impl FnMut(&str, u128, &str, &str, &[u8]) -> std::io::Result<String>,
+) -> Result<Vec<String>, RequestError> {
+    let (header, rest) = decode_envelope_header(body).map_err(RequestError::InvalidEnvelope)?;
+    let parts: Vec<(PartHeader, &[u8])> = PartsIter::new(rest, header.part_count)
+        .collect::<Result<_, _>>()
+        .map_err(RequestError::InvalidEnvelope)?;
+
+    fs::create_dir_all(dir).map_err(RequestError::StorageFailure)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
 
-    let mut suffix = 0u32;
-    loop {
-        let filename = if suffix == 0 {
-            format!("{UPLOADS_DIR}/upload_{timestamp}.bin")
-        } else {
-            format!("{UPLOADS_DIR}/upload_{timestamp}_{suffix}.bin")
-        };
-
-        match OpenOptions::new().write(true).create_new(true).open(&filename) {
-            Ok(mut file) => {
-                file.write_all(body)?;
-                file.flush()?;
-                return Ok(filename);
+    let mut filenames = Vec::new();
+    for (part_header, payload) in parts {
+        let (label, ext) = part_file_naming(part_header.kind);
+        println!(
+            "  event_id={} part: kind={:?} encoding={:?} timestamp_ms={} duration_ms={} len={}",
+            header.event_id,
+            part_header.kind,
+            part_header.encoding,
+            part_header.timestamp_ms,
+            part_header.duration_ms,
+            part_header.len
+        );
+        match committer(dir, timestamp, label, ext, payload) {
+            Ok(filename) => filenames.push(filename),
+            Err(e) => {
+                for filename in &filenames {
+                    let _ = fs::remove_file(filename);
+                }
+                return Err(RequestError::StorageFailure(e));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                suffix += 1;
-                continue;
-            }
-            Err(e) => return Err(e),
         }
     }
+    Ok(filenames)
+}
+
+fn store_event(dir: &str, body: &[u8]) -> Result<Vec<String>, RequestError> {
+    store_event_with_committer(dir, body, commit_part_file)
 }
 
 /// Does the actual request handling; the caller is responsible for turning
@@ -210,8 +353,10 @@ fn process_request(stream: &mut TcpStream) -> Result<(), RequestError> {
     let body = read_exact_body(stream, buf, headers_end, content_length)?;
     println!("body: {} bytes, validated complete", body.len());
 
-    let filename = store_upload(&body)?;
-    println!("stored: {filename}");
+    let filenames = store_event(UPLOADS_DIR, &body)?;
+    for filename in &filenames {
+        println!("stored: {filename}");
+    }
 
     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     stream.write_all(response)?;
@@ -300,6 +445,219 @@ mod tests {
         let mut reader = Cursor::new(data);
         let err = read_headers(&mut reader).expect_err("unterminated over-limit data should be rejected");
         assert!(matches!(err, RequestError::HeadersTooLarge));
+    }
+
+    /// A scratch directory under the OS temp dir, unique per test run, so
+    /// concurrent `cargo test` runs (and repeated runs) never collide or
+    /// interfere with the real `UPLOADS_DIR`. Callers remove it when done.
+    fn scratch_dir(label: &str) -> String {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("camera_server_test_{label}_{unique}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn thumbnail_part_header(len: u32) -> [u8; shared::PART_HEADER_LEN] {
+        shared::encode_part_header(PartKind::Thumbnail, shared::Encoding::Jpeg, 0, 0, len)
+    }
+
+    fn video_part_header(len: u32) -> [u8; shared::PART_HEADER_LEN] {
+        shared::encode_part_header(PartKind::Video, shared::Encoding::RecorderFrames, 0, 5000, len)
+    }
+
+    #[test]
+    fn store_event_writes_a_thumbnail_part_as_jpg() {
+        let dir = scratch_dir("thumbnail");
+        let jpeg = b"fake-jpeg-bytes";
+        let mut body = Vec::new();
+        body.extend_from_slice(&shared::encode_envelope_header(1, 1));
+        body.extend_from_slice(&thumbnail_part_header(jpeg.len() as u32));
+        body.extend_from_slice(jpeg);
+
+        let filenames = store_event(&dir, &body).expect("valid single-thumbnail event should store");
+        assert_eq!(filenames.len(), 1);
+        assert!(filenames[0].ends_with(".jpg"), "got {:?}", filenames[0]);
+        let stored = fs::read(&filenames[0]).expect("stored file should be readable");
+        assert_eq!(stored, jpeg);
+        // No temp files should be left behind once the event is fully
+        // committed.
+        let leftover_tmp = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with(".tmp_"));
+        assert!(!leftover_tmp, "temp file left behind after successful commit");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_event_writes_one_file_per_part() {
+        let dir = scratch_dir("multipart");
+        let thumb = b"thumb-bytes";
+        let video = b"video-bytes";
+        let mut body = Vec::new();
+        body.extend_from_slice(&shared::encode_envelope_header(2, 2));
+        body.extend_from_slice(&thumbnail_part_header(thumb.len() as u32));
+        body.extend_from_slice(thumb);
+        body.extend_from_slice(&video_part_header(video.len() as u32));
+        body.extend_from_slice(video);
+
+        let filenames = store_event(&dir, &body).expect("valid two-part event should store");
+        assert_eq!(filenames.len(), 2);
+        assert!(filenames[0].ends_with("_thumbnail.jpg"), "got {:?}", filenames[0]);
+        assert!(filenames[1].ends_with("_video.bin"), "got {:?}", filenames[1]);
+        assert_eq!(fs::read(&filenames[0]).unwrap(), thumb);
+        assert_eq!(fs::read(&filenames[1]).unwrap(), video);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_event_rejects_malformed_envelope() {
+        let dir = scratch_dir("malformed");
+        let err = store_event(&dir, b"not an envelope").expect_err("garbage body should be rejected");
+        assert!(matches!(
+            err,
+            RequestError::InvalidEnvelope(EnvelopeError::BadMagic)
+        ));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_event_rejects_zero_part_envelope() {
+        let dir = scratch_dir("zero_parts");
+        let body = shared::encode_envelope_header(0, 1);
+        let err = store_event(&dir, &body).expect_err("zero-part envelope should be rejected");
+        assert!(matches!(
+            err,
+            RequestError::InvalidEnvelope(EnvelopeError::EmptyEvent)
+        ));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_event_rejects_trailing_bytes_and_writes_nothing() {
+        let dir = scratch_dir("trailing_bytes");
+        let jpeg = b"fake-jpeg-bytes";
+        let mut body = Vec::new();
+        body.extend_from_slice(&shared::encode_envelope_header(1, 1));
+        body.extend_from_slice(&thumbnail_part_header(jpeg.len() as u32));
+        body.extend_from_slice(jpeg);
+        body.extend_from_slice(b"trailing-junk-not-declared-by-part-count");
+
+        let err = store_event(&dir, &body).expect_err("trailing bytes should be rejected");
+        assert!(matches!(
+            err,
+            RequestError::InvalidEnvelope(EnvelopeError::TrailingBytes)
+        ));
+        // Parsing fails before any part is written, so the directory should
+        // never even get created.
+        assert!(!std::path::Path::new(&dir).exists());
+    }
+
+    #[test]
+    fn store_event_writes_nothing_when_the_first_part_fails_to_commit() {
+        let dir = scratch_dir("fail_first");
+        let thumb = b"thumb-bytes";
+        let video = b"video-bytes";
+        let mut body = Vec::new();
+        body.extend_from_slice(&shared::encode_envelope_header(2, 10));
+        body.extend_from_slice(&thumbnail_part_header(thumb.len() as u32));
+        body.extend_from_slice(thumb);
+        body.extend_from_slice(&video_part_header(video.len() as u32));
+        body.extend_from_slice(video);
+
+        let err = store_event_with_committer(&dir, &body, |_, _, _, _, _| {
+            Err(std::io::Error::other("simulated failure on first part"))
+        })
+        .expect_err("first part failing to commit should fail the whole event");
+        assert!(matches!(err, RequestError::StorageFailure(_)));
+
+        let leftover: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+        assert!(leftover.is_empty(), "expected nothing written, found {leftover:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_event_rolls_back_the_first_part_when_the_second_part_fails_to_commit() {
+        let dir = scratch_dir("fail_second");
+        let thumb = b"thumb-bytes";
+        let video = b"video-bytes";
+        let mut body = Vec::new();
+        body.extend_from_slice(&shared::encode_envelope_header(2, 11));
+        body.extend_from_slice(&thumbnail_part_header(thumb.len() as u32));
+        body.extend_from_slice(thumb);
+        body.extend_from_slice(&video_part_header(video.len() as u32));
+        body.extend_from_slice(video);
+
+        let mut call_count = 0u32;
+        let err = store_event_with_committer(&dir, &body, |dir, ts, label, ext, payload| {
+            call_count += 1;
+            if call_count == 1 {
+                // Let the first part (thumbnail) really commit, so there is
+                // a real file on disk to verify gets rolled back.
+                commit_part_file(dir, ts, label, ext, payload)
+            } else {
+                Err(std::io::Error::other("simulated failure on second part"))
+            }
+        })
+        .expect_err("second part failing to commit should fail the whole event");
+        assert!(matches!(err, RequestError::StorageFailure(_)));
+        assert_eq!(call_count, 2, "both parts should have been attempted");
+
+        let leftover: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+        assert!(
+            leftover.is_empty(),
+            "expected the first part's file to be rolled back, found {leftover:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_event_leaves_no_partial_files_when_storage_fails() {
+        // A real (not simulated) directory-wide storage failure, exercising
+        // the actual filesystem/permissions path rather than an injected
+        // committer -- complements the two tests above, which pin down
+        // *which* part failed and *which* files got rolled back precisely.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("rollback");
+        fs::create_dir_all(&dir).unwrap();
+
+        let thumb = b"thumb-bytes";
+        let video = b"video-bytes";
+        let mut body = Vec::new();
+        body.extend_from_slice(&shared::encode_envelope_header(2, 3));
+        body.extend_from_slice(&thumbnail_part_header(thumb.len() as u32));
+        body.extend_from_slice(thumb);
+        body.extend_from_slice(&video_part_header(video.len() as u32));
+        body.extend_from_slice(video);
+
+        // Read-only *after* creating the directory, so every part -- not
+        // just a later one -- has nowhere to go: the simplest deterministic
+        // way to force a real storage failure without depending on actual
+        // disk space.
+        let original_perms = fs::metadata(&dir).unwrap().permissions();
+        let mut readonly = original_perms.clone();
+        readonly.set_mode(0o500); // r-x------, no write
+        fs::set_permissions(&dir, readonly).unwrap();
+
+        let result = store_event(&dir, &body);
+
+        // Restore permissions before asserting/cleaning up, so the test
+        // doesn't leave an unremovable directory behind on failure.
+        fs::set_permissions(&dir, original_perms).unwrap();
+
+        let err = result.expect_err("write into a read-only directory should fail");
+        assert!(matches!(err, RequestError::StorageFailure(_)));
+        let leftover: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+        assert!(leftover.is_empty(), "expected no files left behind, found {leftover:?}");
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
 
