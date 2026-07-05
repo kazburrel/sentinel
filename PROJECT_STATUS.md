@@ -445,11 +445,164 @@ first, not yet folded into `main.rs`.
   the plan ("Once hardware-verified, integrate it into the main firmware"), this is
   now hardware-verified and ready for that integration.
 
+## Milestone 9 — `motion_record_test.rs` moved into `main.rs` unchanged
+
+User's assessment: the current code already has motion-triggered 5-second recording,
+but is missing *product-style event behavior* -- a real state machine (continue
+recording while PIR stays active, a post-motion tail, a safe max clip length,
+merging renewed motion into the current event instead of duplicate clips, waiting for
+PIR to go low before rearming, thumbnail-frame selection, an actual export-timing
+decision instead of immediate USB dump, and eventually circular pre-roll). None of
+that is built yet -- deliberately. The identified smallest next step was purely
+relocating the already-verified fixed-5-second recorder from `motion_record_test.rs`
+into the real `main.rs`, with **no logic changes**, and re-verifying on hardware before
+touching any of the state-machine behavior.
+
+- **`firmware/src/bin/main.rs`** replaced with `motion_record_test.rs`'s content
+  verbatim (same PIR/LED/PSRAM-record/raw-export logic, same 10s idle heartbeat, same
+  debounced-motion re-sync after each recording), keeping `main.rs`'s original
+  `#![deny(clippy::mem_forget)]`/`#![deny(clippy::large_stack_frames)]` lint attributes
+  and its app-descriptor/doc-comment conventions. `firmware/src/bin/motion_record_test.rs`
+  itself is left in place unchanged, as the standalone reference/regression test binary
+  -- same precedent as `camera_test.rs` staying alongside `main.rs` since Milestone 5.
+- **Verified on hardware**: reflashed the real `firmware` binary (not the test one) and
+  triggered two motion events in one boot -- recording #1: 64 frames, 0 failures,
+  5.02s, 743,193 bytes; recording #2: 69 frames, 0 failures, 5.06s, 816,274 bytes.
+  Identical behavior to the standalone test binary's verified runs: LED red during
+  recording, correct reset between events, correct heartbeat while idle, zero crashes.
+- **Still exactly as limited as Milestone 8** -- this was a pure relocation, not new
+  capability. Every item in the "product-style event behavior" list above (state
+  machine, post-motion tail, max clip length, dedup, rearm-on-low, thumbnail selection,
+  export-timing policy, pre-roll) is still unimplemented. This milestone only confirms
+  the verified recorder behaves identically once it's the thing that actually ships.
+
+## Milestone 10 — doorbell-style event state machine in `main.rs`
+
+Replaced Milestone 9's fixed-5-second clip with a real motion-event state machine, per
+explicit spec. Reviewed `PROJECT_STATUS.md` and the actual code first (per
+instruction), and found a real pre-existing gap while doing so: `camera.rs`'s
+`trim_to_jpeg()` used `.unwrap_or(0)`/`.unwrap_or(captured_len)` for a missing JPEG
+SOI/EOI marker -- a corrupted frame would silently "succeed" with garbage bounds
+instead of erroring. Fixed as part of this milestone since it was explicitly requested
+("Add strict JPEG validation... must return an error, not silently succeed").
+
+- **`firmware/src/camera.rs`**: `trim_to_jpeg()` now returns `Result<usize, CameraError>`
+  instead of always succeeding; new `CameraError::InvalidJpeg` variant. Checked (via
+  `grep`) that nothing does exhaustive matching on `CameraError` elsewhere in the
+  codebase, so this is a non-breaking addition -- confirmed by building every other
+  binary (`camera_test`, `video_test`, `mjpeg_test`, `uxga_test`, `uxga_video_test`,
+  `psram_test`, `psram_record_test`, `motion_record_test`) after the change, all clean.
+- **`firmware/src/bin/main.rs`** event logic: on motion, first frame uses
+  `capture_jpeg()` (settling/warmup capture, correct after sitting idle) and is copied
+  into a new internal-RAM thumbnail buffer as "the future event thumbnail" -- no
+  separate photo taken, just an extra copy of the frame already in hand. Every
+  subsequent frame in the same event uses `capture_jpeg_continuous()`. Per-frame,
+  after capturing: check `pir.is_high()` -- HIGH clears any pending tail deadline
+  outright (this single rule is what makes renewed motion during the tail restart the
+  countdown, with no special-case code needed); LOW starts a 2-second tail deadline if
+  one isn't already running. Event stops once that tail expires **and** at least 5
+  seconds have elapsed since the event started (so a very brief motion blip still
+  produces a full-length minimum clip, not a truncated one). Rearming reuses the
+  existing `motion = MotionSensor::new(pir.is_high())` resync from Milestone 8/9 --
+  already exactly "wait for PIR to go LOW before rearming" with no new mechanism
+  needed, since a `MotionSensor` constructed while PIR is still HIGH won't fire a new
+  `Detected` edge until it actually cycles LOW then HIGH again.
+- **Verified on hardware**: 3 independent events in one boot, each landing at ~5.4-5.7s
+  (consistent with a brief wave -- PIR drops low almost immediately, so the event runs
+  until the 5s minimum, not the full tail-driven length), thumbnails preserved
+  (12-21KB), low failure counts (1, 0, 1 frames -- consistent with the occasional DMA
+  hiccups seen in earlier milestones, not new rejections from the stricter JPEG
+  validation). Decoded event #1 and confirmed a valid, playable 640x480 `.mp4`
+  (56 frames, matching the reported count exactly).
+- **A 15-second absolute max was initially added, then explicitly removed** per
+  direct instruction -- there is now no fixed maximum; an event only ends when PIR has
+  genuinely gone LOW past the 2s tail, or PSRAM fills up. At the measured frame rate
+  and JPEG sizes, the 8MB PSRAM is expected to hold roughly 35-50 seconds rather than
+  several minutes. Verified
+  again on hardware after the removal: a real walk-around test produced a 33.14-second,
+  409-frame event that decoded and assembled into a valid clip.
+
+### Behavior review: event can stop too early relative to real presence
+
+During the 33-second walk-around test, the user's impression was that recording ended
+*before* they physically finished moving (specifically: before finishing setting an
+object down). The code path was checked and the tail logic is behaving exactly as
+designed: any HIGH reading cancels a pending tail, and only a sustained LOW ends the
+event. Research confirmed this is most likely a sensor-behavior issue rather than a
+state-machine bug:
+
+1. **PIR sensors are inherently worse at slow/small motion** than fast lateral
+   movement -- carefully lowering an object is exactly the kind of motion a PIR can
+   miss, potentially reporting LOW a couple seconds before the person is actually done.
+2. **The AM312 has approximately a 2-second trigger/hold period and a 2-second
+   blocking period.** The firmware's current 2-second tail therefore provides almost
+   no margin for a sensor LOW gap or missed slow movement.
+
+**Decision, now implemented:** `TAIL_DURATION` raised from 2 seconds to 5 seconds in
+`firmware/src/bin/main.rs`, no other event behavior changed. Built clean (`cargo build`
++ `cargo clippy`, both with zero warnings) and flashed to hardware. **The
+slow-lowering re-test to confirm this actually fixes the early-stop behavior has not
+been run/confirmed yet** -- the user was mid-test (via `scripts/capture_psram_video.sh`)
+when this doc was last updated; result pending.
+
+### Dev convenience: `RECORDING_ENABLED` compile-time toggle
+
+User asked for a way to stop the board recording every time they move near it while
+still developing. Added `const RECORDING_ENABLED: bool = true;` near the top of
+`firmware/src/bin/main.rs` -- when `false`, a detected motion edge just prints
+`motion detected -- recording disabled, ignoring` and skips the whole
+capture/record/export block entirely; camera/PSRAM/LED still initialize normally at
+boot either way, so this only silences the recording action itself, not hardware
+setup. Flip and reflash to toggle; no new hardware required. Built and clippy-checked
+clean. The user then flipped it to `false` directly in the editor for their current
+dev session (not yet reflashed as of this doc update).
+
+Discussed the natural evolution of this: once the WiFi/server milestone exists, the
+right design is for this to become a remotely-settable flag (app/web UI sets
+enabled/disabled on the server, firmware checks it instead of a hardcoded constant)
+rather than a compile-time constant requiring a reflash to change. Not building that
+now -- it's blocked on WiFi existing at all, and the compile-time flag is the correct
+stopgap until then.
+
+### Known deferred limitations
+
+- The first valid JPEG is preserved in RAM as a thumbnail, but it is not separately
+  exported or saved yet. Its transport/storage policy belongs with WiFi/server work.
+- Raw USB clip export is synchronous and blocks motion detection. Motion occurring
+  during an export is therefore missed; non-blocking/queued transfer is deferred to
+  the transport milestone.
+- There is no circular pre-roll, so a clip starts only after the PIR triggers. Pre-roll
+  remains explicitly deferred.
+- With 8MB PSRAM, measured frame sizes, and the current frame rate, practical clip
+  capacity is roughly 35-50 seconds, not several minutes. PSRAM-full remains the hard
+  stop because the explicitly removed fixed-duration maximum has not been restored.
+
+### Future media payload design — optional audio
+
+The current board/setup has no microphone, so recordings are video-only and no audio
+capture work belongs in the current camera milestone. However, the upcoming shared
+protocol/server design must not hardcode an event as "video only."
+
+- Define an event envelope in the `shared` crate with event metadata and independently
+  described media parts/streams (for example: thumbnail JPEG, MJPEG video, and future
+  audio). Each part should identify its media kind, encoding, byte length, and timing
+  information needed for later audio/video synchronization.
+- Audio is **optional**. Current firmware sends no audio part at all; it must not
+  allocate or transmit an empty audio buffer merely to reserve the feature.
+- The server must accept and store events containing whichever supported media parts
+  are present. Initially that means thumbnail/video only.
+- When an external microphone is added later, firmware-side microphone capture can
+  attach an audio part through the same protocol instead of redesigning the payload.
+- This is a future-proofing requirement for the WiFi/server-transfer milestone, not a
+  claim that audio recording is currently implemented.
+
 ## Next steps (not yet started)
 
-- **Integrate `motion_record_test.rs` into `main.rs`**: fold the verified
-  motion-triggered PSRAM recording behavior into the real firmware, replacing or
-  supplementing the current single-photo-per-motion-event behavior.
+- **Confirm the 5s tail actually fixes the early-stop behavior**: `TAIL_DURATION` is
+  already raised to 5s and flashed (see Milestone 10 above) -- what's left is running
+  the same slow-lowering motion test again and confirming the recording now covers the
+  whole motion, including the drop. If it still cuts off early, the AM312's own
+  blind/retrigger timing may need more than 5s of margin, or a different mitigation.
 - Decide what happens to a recorded clip after export (export automatically over
   serial like the test binary? only on request? relates directly to the still-pending
   WiFi/upload milestone below, which is the real intended transport).
@@ -465,24 +618,31 @@ first, not yet folded into `main.rs`.
   gets dumped to serial for local debugging. The real pipeline needs: connect to WiFi
   (`esp-radio`/`embassy-net`, both already in `Cargo.toml`), POST the captured bytes to
   the `server` crate (already scaffolded in the workspace, not yet implemented), get a
-  response back, decide what to do with it (eventually: phone notification).
+  response back, decide what to do with it (eventually: phone notification). During
+  this milestone, replace the untouched `shared` crate stub with the extensible event
+  envelope described above: thumbnail/video now, optional audio later.
 - `FOR_CODEX.md`'s original content (UPDATE 1-8) can likely be deleted entirely now —
   it documents a hang that was never real, and is superseded by this file.
 
 ## Current exact codebase state
 
-**Committed to git** (through `928777e`, Milestone 7): PIR + WS2812 (milestones 1-3),
+**Committed to git** (through `6da4771`, Milestone 8): PIR + WS2812 (milestones 1-3),
 OV3660 camera capture (Milestone 4), reusable `CameraHandle` + PIR integration
 (Milestone 5), continuous capture/MJPEG video/UXGA/3x FPS fix (Milestone 6),
-PSRAM-backed record-then-export (Milestone 7), workspace structure, `shared`/`server`
+PSRAM-backed record-then-export (Milestone 7), motion-triggered PSRAM recording as a
+standalone test binary (Milestone 8), workspace structure, `shared`/`server`
 scaffolding.
 
-**Uncommitted, current** (Milestone 8, described above):
-- `firmware/src/bin/motion_record_test.rs` — new, PIR-triggered version of Milestone
-  7's `psram_record_test.rs`, with an added idle heartbeat print
-- `firmware/Cargo.toml` — `[[bin]]` entry for `motion_record_test`
-- `scripts/capture_video.sh` — modified, same temp-dir-for-frames fix applied
-  retroactively (only the final video is saved to the Desktop, not each burst frame)
+**Uncommitted, current** (Milestones 9 and 10, described above):
+- `firmware/src/bin/main.rs` — Milestone 9's relocation, then Milestone 10's full
+  doorbell-style event state machine on top (min duration, tail, renewed-motion
+  handling, thumbnail preservation, no fixed max), then `TAIL_DURATION` raised
+  2s → 5s (built, clippy-checked, flashed; hardware re-test result pending), then a
+  `RECORDING_ENABLED` dev-convenience toggle added -- **currently set to `false`**
+  in the working tree (user flipped it directly in the editor for their current dev
+  session; not yet reflashed with this value as of this doc update)
+- `firmware/src/camera.rs` — `trim_to_jpeg()` now returns `Result`, new
+  `CameraError::InvalidJpeg` variant
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
@@ -512,19 +672,28 @@ scaffolding.
 
 ## What's needed from Codex right now
 
-Nothing blocking — **Milestones 5 through 8 are complete** (reusable `CameraHandle`,
-PIR-triggered capture in `main.rs`, continuous-capture MJPEG video pipeline, UXGA
-resolution, 3x FPS fix, PSRAM-backed record-then-export, and now motion-triggered
-PSRAM recording via `motion_record_test.rs` — all verified repeatedly on hardware,
-including two independent recordings in a single boot). Codex's PSRAM research was
-verified line-by-line against the real `esp-hal`/`esp-alloc` source before
-implementing and matched exactly, including the atomics-in-PSRAM warning; the
-motion-triggering step it recommended last is now done too. One optional, non-blocking
-item if useful: trawling GitHub issues/forums/Reddit/Discord for OV3660-specific
-community register tweaks for image quality (see "Image quality investigation" above,
-point 7) — deliberately not fabricated here since there's no live access to those
-discussions in this session. Otherwise open to input on the next steps: integrating
-`motion_record_test.rs` into `main.rs`, or the next major milestone, WiFi + upload to
-the server (see "Next steps" above), e.g. `esp-radio`/`embassy-net` setup specifics or
-server request format, but nothing is
-currently blocked.
+Nothing blocking — **Milestones 5 through 10 are complete** (reusable `CameraHandle`,
+PIR-triggered capture, continuous-capture MJPEG video pipeline, UXGA resolution, 3x FPS
+fix, PSRAM-backed record-then-export, motion-triggered PSRAM recording, and now a real
+doorbell-style event state machine in `main.rs` -- min duration, continue-while-active,
+post-motion tail with restart-on-renewed-motion, no fixed maximum, thumbnail
+preservation, strict JPEG validation -- all verified repeatedly on hardware, including
+a real 33-second walk-around producing a valid clip). Of the user's original
+product-behavior gap list, everything is now done except: an actual export-timing
+policy decision (still immediate raw USB dump every time, not yet tied to the
+still-pending WiFi milestone), and circular pre-roll (explicitly deferred, not needed
+yet).
+
+**Resolved behavior question:** AM312 timing research found that its approximately
+2-second trigger/hold and blocking behavior leaves no useful margin when paired with
+the firmware's previous 2-second tail. `TAIL_DURATION` is now raised to 5 seconds,
+built and flashed -- the same slow-lowering hardware test needs to be repeated to
+confirm this actually resolves the early-stop behavior. Not yet confirmed either way.
+
+Also still open, lower priority: trawling GitHub issues/forums/Reddit/Discord for
+OV3660-specific community register tweaks for image quality (see "Image quality
+investigation" above, point 7) — deliberately not fabricated here since there's no live
+access to those discussions in this session. Otherwise open to input on export-timing
+policy, or the next major milestone, WiFi + upload to the server (see "Next steps"
+above), e.g. `esp-radio`/`embassy-net` setup specifics or server request format, but
+nothing is currently blocked.

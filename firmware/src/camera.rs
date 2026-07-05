@@ -27,6 +27,9 @@ pub enum CameraError {
     DmaSetup,
     FrameTooBigForBuffer,
     DmaFinishedBeforeEof,
+    /// Captured bytes were missing a JPEG SOI (`FF D8`) or EOI (`FF D9`)
+    /// marker -- a corrupted/incomplete frame, not a real photo.
+    InvalidJpeg,
 }
 
 /// Owns the already-configured camera hardware (LCD-CAM/DMA peripheral +
@@ -205,7 +208,7 @@ impl<'d> CameraHandle<'d> {
         self.camera = Some(camera);
 
         result?;
-        Ok(trim_to_jpeg(jpeg_buf, frame_len))
+        trim_to_jpeg(jpeg_buf, frame_len)
     }
 }
 
@@ -213,24 +216,26 @@ impl<'d> CameraHandle<'d> {
 /// captured bytes, discarding any trailing DMA padding/garbage the sensor
 /// appends after the real frame. Shifts the found JPEG data to the start of
 /// `buf` (so callers can always just use `&jpeg_buf[..returned_len]`) and
-/// returns its length.
-fn trim_to_jpeg(buf: &mut [u8], captured_len: usize) -> usize {
+/// returns its length. A missing SOI or EOI is a corrupted/incomplete frame,
+/// not a real photo -- returns `Err` rather than silently trimming to
+/// whatever bytes happen to be there.
+fn trim_to_jpeg(buf: &mut [u8], captured_len: usize) -> Result<usize, CameraError> {
     let data = &buf[..captured_len];
 
     let soi = data
         .windows(2)
         .position(|w| w == [0xFF, 0xD8])
-        .unwrap_or(0);
+        .ok_or(CameraError::InvalidJpeg)?;
 
     let eoi = data[soi..]
         .windows(2)
         .position(|w| w == [0xFF, 0xD9])
         .map(|pos| soi + pos + 2)
-        .unwrap_or(captured_len);
+        .ok_or(CameraError::InvalidJpeg)?;
 
     let len = eoi - soi;
     buf.copy_within(soi..eoi, 0);
-    len
+    Ok(len)
 }
 
 #[allow(dead_code)]
