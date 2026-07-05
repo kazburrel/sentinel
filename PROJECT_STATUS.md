@@ -1096,26 +1096,82 @@ lower-priority protocol gaps, all fixed and tested:
 **`main.rs` integration is still the next step, not yet started** -- both hardening
 passes above were explicitly prerequisites for it, not the integration itself.
 
+## Milestone 15 — `main.rs` uploads real motion events over WiFi (verified on hardware)
+
+Milestone 14 (both hardening passes) was committed first as a safe checkpoint
+(`65940e9`), then `main.rs` itself was wired up: the real PIR-triggered doorbell event
+state machine from Milestones 9-10 now uploads its thumbnail + video over WiFi using
+the same envelope and request shape `event_upload_video_test.rs` proved, instead of
+that logic living only in a standalone test binary.
+
+- **WiFi connect/DHCP added to `main.rs`** at boot, right after camera init (same
+  block-until-connected pattern as every WiFi test binary) -- blocks startup until WiFi
+  is up, since there is no offline/degraded-start mode yet (deliberately deferred, see
+  Next steps).
+- **New `upload_event()` async function** builds the two-part envelope (`Thumbnail` +
+  `Video`, event ID = the existing per-boot `recording_count`) and sends it over one TCP
+  connection, returning an `UploadOutcome` enum (`Success` / `Rejected(status_code)` /
+  `ConnectFailed` / `IoError`) instead of just logging a raw response string -- this is
+  the actual "distinguish success from failure" logic, not just a human squinting at
+  printed bytes. Required adding a targeted, justified `#[allow(clippy::large_stack_frames)]`
+  (`main.rs` denies this lint crate-wide) since the request-header string plus the
+  512-byte response buffer push the function over clippy's default threshold; the same
+  shape was already proven fine on hardware in `event_upload_video_test.rs`.
+- **Called right after each event finishes recording**, before the existing USB raw
+  export -- logs one clear `WiFi upload SUCCEEDED` / `FAILED -- <reason>` line, then USB
+  export always runs regardless of that outcome. No retry logic yet -- a single attempt,
+  exactly as scoped; retries/offline handling are next.
+- **`RECORDING_ENABLED` flipped to `true`** (was `false`, the dev-convenience toggle from
+  Milestone 10) -- needed to actually trigger real events for this test; left `true`
+  since the project has moved from "developing near the board" into real reliability
+  testing. Flip back to `false` and reflash if that convenience is needed again.
+- **Verified on real hardware with a real failed-server scenario**, not just the happy
+  path -- 4 consecutive real motion events (hand-waved in front of the PIR sensor):
+  - Event #1 (91-110 frames, ~7.3-8.2s each depending on how long motion lasted, matching
+    the doorbell state machine's variable duration, not a fixed test-binary duration) and
+    #2: server running -> **WiFi upload SUCCEEDED**, both parts stored server-side and
+    confirmed valid (thumbnail opens as a real JPEG -- visually confirmed, a real photo
+    of a ceiling; video decodes cleanly via `decode_raw_capture.py`, 55/91/110 frames
+    depending on event, no truncation warnings).
+  - Server killed, event #3 triggered: **WiFi upload FAILED -- could not connect to
+    server**, logged cleanly, no crash/hang -- USB export still ran (confirmed
+    `RAW EXPORT BEGIN`/`END` present in the serial log right after the failure line) --
+    and the state machine still rearmed normally afterward.
+  - Server restarted, event #4 triggered: **WiFi upload SUCCEEDED** again, with zero
+    intervention beyond restarting the server -- confirms the single-attempt path
+    recovers on its own once connectivity returns, exactly as expected before any retry
+    logic exists.
+  - One stray upload from the *previous* firmware (`event_upload_video_test.rs`, still
+    mid-retry-loop during the reflash window) landed on the fresh server with a
+    telltale fixed ~5s duration -- correctly identified as test-session noise, not a
+    `main.rs` bug, and discarded.
+  - All test uploads and artifacts deleted afterward; real production uploads from this
+    session were not kept.
+- `cargo build`/`cargo clippy --bins` clean across the whole firmware workspace
+  (`--all-targets` still fails for unrelated, pre-existing reasons -- `no_std` binaries
+  can't build a `test` harness -- not something this change touched).
+
+**Not yet done, explicitly next**: upload retries / offline handling (only after this
+single-attempt path is proven reliable, which the above hardware test was the first
+real pass at) -- see Next steps. Battery work follows that.
+
 ## Next steps (not yet started)
 
 - **Audio part, optional, later.** `PartKind::Audio` already exists in the envelope
   (reserved, unused) -- add it only once there's an actual audio source to capture;
   the wire format and server storage path need no changes to support it when that
   happens.
-- **Replace the wired delivery path with WiFi** in `main.rs` itself now that real event
-  data (thumbnail + video) is proven flowing over HTTP end-to-end on hardware
-  (Milestone 14) -- the current ESP32 -> USB serial -> Mac script path already exports
-  recordings and produces playable video; preserve it as a debugging/fallback path
-  while adding ESP32 -> WiFi -> Mac server delivery driven by the real PIR-triggered
-  event state machine (`main.rs`'s doorbell-style logic from Milestones 9-10), not a
-  fixed-duration test loop like `event_upload_video_test.rs`.
+- **Upload retries / offline handling, now the immediate next step.** `main.rs`
+  (Milestone 15) proved a single-attempt WiFi upload works end-to-end on hardware,
+  including a real failed-server scenario, and USB export always preserves the
+  recording regardless -- but a failed upload today is simply lost from the server's
+  perspective (no retry, no local queue). Next: retry the same event (still in PSRAM/
+  the thumbnail buffer at that point) some bounded number of times, and/or a persistent
+  local queue (onboard microSD, see below) for when WiFi itself is down, not just the
+  server.
 - Build out the `server` crate's request routing beyond the single `POST /upload`
   endpoint (structured per-part storage is now done, per Milestone 14) once there's an
   actual second concern to route to (e.g. an AI-processing trigger or a query endpoint).
-- Define richer acknowledgement/retry semantics for wireless uploads (the receiver
-  already returns correct HTTP status codes; the firmware side doesn't yet act on
-  failure beyond printing it) -- more pressing once `main.rs` depends on delivery
-  actually succeeding, rather than a test binary that just logs and retries next loop.
 - Decide a real container format for the video part once it's time to make clips
   independently playable server-side without a decode script (currently `.bin`,
   requiring `decode_raw_capture.py`-style parsing) -- e.g. actual MJPEG/AVI muxing, or
@@ -1154,7 +1210,7 @@ bounded header/body sizes, read timeout, exact-body validation, collision-safe
 filenames, generic `404`s, and both rounds of post-review fixes; `http_post_test.rs`;
 gitignored-credential templates; `DEPLOYMENT.md`.
 
-**Uncommitted, current** (Milestone 14, v2 envelope after post-review hardening,
+**Committed** (`65940e9`, Milestone 14, v2 envelope after post-review hardening,
 described above):
 - `shared/src/lib.rs` — the event envelope, v2: `MAGIC`/`VERSION` constants,
   `PartKind`/`Encoding`/`EnvelopeError` enums, `encode_envelope_header` (now takes
@@ -1186,6 +1242,17 @@ described above):
   `#[cfg(test)]` unit tests total (`cargo test -p server`), including two
   fault-injection tests pinning down exactly which part fails and which files get
   rolled back.
+
+**Uncommitted, current** (Milestone 15, described above):
+- `firmware/src/bin/main.rs` — WiFi connect/DHCP added at boot; new `UploadOutcome` enum
+  and `upload_event()` async function (builds the two-part envelope, sends it, parses
+  the response into `Success`/`Rejected(status_code)`/`ConnectFailed`/`IoError`); called
+  right after each real motion event finishes recording, logging a clear
+  success/failure line, with the pre-existing USB raw export still always running
+  afterward regardless of the WiFi outcome. `RECORDING_ENABLED` flipped from `false` to
+  `true`. Verified on real hardware across 4 real motion events including a real
+  failed-server scenario and automatic recovery once the server came back (see
+  Milestone 15 above for the full blow-by-blow).
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
@@ -1240,22 +1307,35 @@ live-verified against the real running server binary via `curl` instead (a valid
 envelope stored correctly, a kind/encoding mismatch correctly rejected) plus a firmware
 rebuild to confirm no compile breakage, rather than a full hardware reflash.
 
-**Immediate next step**: replace `main.rs`'s wired USB delivery path with WiFi, driven
-by the real PIR-triggered doorbell-style event state machine (Milestones 9-10) instead
-of `event_upload_video_test.rs`'s fixed-duration test loop -- that's the last piece
-connecting a real motion event to a real upload, end to end, unattended. This was
-explicitly deferred until both hardening passes above landed and were verified, so it's
-ready to start now. After that: richer delivery acknowledgement/retry semantics (the
-`500` vs `400` distinction, and the now-logged-but-not-yet-deduplicated `event_id`, are
-exactly what those retries will need to key off), and eventually a real container
-format for the video part so it doesn't need `decode_raw_capture.py`-style parsing to
-play. The longer-term deployment design is still a dedicated IoT network/VLAN that
-permits only the camera-to-server upload path plus TLS; the current shared home subnet
-+ plaintext HTTP is a development setup, not the final security boundary -- but the
-receiver itself has now been through two rounds of security review plus a real-media
-integration pass and two rounds of its own post-review hardening, with automated
-regression coverage throughout, including fault-injection tests for the exact failure
-sequences that matter.
+**`main.rs` now uploads real motion events over WiFi (Milestone 15), verified on
+hardware including a real failed-server scenario**: the real PIR-triggered
+doorbell-style event state machine (Milestones 9-10) -- not a test binary's
+fixed-duration loop -- now uploads its thumbnail + video as one envelope right after
+each event finishes recording, logs a clear success/failure line via a new
+`UploadOutcome` enum, and always still runs the pre-existing USB raw export regardless
+of the WiFi outcome. 4 consecutive real motion events were tested: 2 succeeded normally
+with the server up, 1 correctly failed (`ConnectFailed`, logged, no crash, USB export
+still ran, state machine still rearmed) when the server was killed mid-test, and 1
+succeeded again immediately once the server came back -- with zero code changes or
+intervention, confirming the single-attempt design recovers on its own. `main.rs`'s
+`RECORDING_ENABLED` was flipped from `false` to `true` to run this test and left that
+way, since the project has moved from "developing near the board" into real
+reliability testing.
+
+**Immediate next step**: upload retries / offline handling, now that the single-attempt
+path has been proven reliable on real hardware (that reliability proof was the explicit
+gate for this work, per the user). The `500` vs `400` distinction, and the
+now-logged-but-not-yet-deduplicated `event_id`, are exactly what retry logic will need
+to key off. After that: battery work (explicitly follows the reliability work, per the
+user), and eventually a real container format for the video part so it doesn't need
+`decode_raw_capture.py`-style parsing to play. The longer-term deployment design is
+still a dedicated IoT network/VLAN that permits only the camera-to-server upload path
+plus TLS; the current shared home subnet + plaintext HTTP is a development setup, not
+the final security boundary -- but the receiver itself has now been through two rounds
+of security review plus a real-media integration pass and two rounds of its own
+post-review hardening, with automated regression coverage throughout, including
+fault-injection tests for the exact failure sequences that matter, and `main.rs` itself
+has now been proven end-to-end on hardware against a real server outage.
 
 Also still open, lower priority: trawling GitHub issues/forums/Reddit/Discord for
 OV3660-specific community register tweaks for image quality (see "Image quality

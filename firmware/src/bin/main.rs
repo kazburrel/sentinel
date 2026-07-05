@@ -7,13 +7,18 @@
 //! continues and the tail restarts. Only stops when PIR has genuinely
 //! stopped (past the tail) or PSRAM fills up. All of that is one clip;
 //! renewed motion within it never starts a second event.
-//! LED off, export the clip as a raw binary dump, wait for PIR to actually
-//! go LOW before rearming (so a person who's still standing there can't
-//! immediately trigger a second event).
+//! LED off, upload the event (thumbnail + video, as the `shared` crate's
+//! event envelope) to the server over WiFi, then export the same clip as a
+//! raw binary dump over USB serial regardless of whether the upload
+//! succeeded -- USB export is a debugging/recovery fallback, not something
+//! the WiFi path's success or failure should ever gate. Wait for PIR to
+//! actually go LOW before rearming (so a person who's still standing there
+//! can't immediately trigger a second event).
 //!
-//! Still not built: pre-roll before motion, and any decision about
-//! when/how a clip actually gets sent anywhere beyond this immediate USB
-//! export. See `PROJECT_STATUS.md`.
+//! Still not built: pre-roll before motion, and upload retries/offline
+//! queuing if the server is unreachable (deliberately deferred until this
+//! single-attempt path has been proven reliable on real hardware -- see
+//! `PROJECT_STATUS.md`).
 
 #![no_std]
 #![no_main]
@@ -24,8 +29,12 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use alloc::format;
 use embassy_executor::Spawner;
+use embassy_net::tcp::TcpSocket;
+use embassy_net::{IpAddress, Runner, StackResources};
 use embassy_time::{Duration, Instant, Timer};
+use embedded_io_async::Write as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level};
 use esp_hal::psram::{Psram, PsramConfig};
@@ -33,20 +42,26 @@ use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::{println, Printer};
+use esp_radio::wifi::{sta::StationConfig, Config as WifiConfig, Interface};
 use firmware::camera::CameraHandle;
 use firmware::ov3660::Framesize;
 use firmware::pir::{MotionEdge, MotionSensor};
 use firmware::recorder::PsramRecorder;
 use firmware::ws2812::ws2812_frame;
+use shared::{
+    encode_envelope_header, encode_part_header, Encoding, PartKind, ENVELOPE_HEADER_LEN, PART_HEADER_LEN,
+};
 use static_cell::StaticCell;
 
 extern crate alloc;
+
+include!("../wifi_credentials.rs");
 
 /// Set to `false` to make PIR motion a no-op -- useful while developing near
 /// the board without triggering real recordings every time you move. Flip
 /// and reflash to toggle; no new hardware required. Camera/PSRAM/LED still
 /// initialize normally either way, only the recording action is skipped.
-const RECORDING_ENABLED: bool = false;
+const RECORDING_ENABLED: bool = true;
 
 const SCRATCH_BUF_SIZE: usize = 64 * 1024;
 static SCRATCH_BUF: StaticCell<[u8; SCRATCH_BUF_SIZE]> = StaticCell::new();
@@ -65,6 +80,12 @@ const TAIL_DURATION: Duration = Duration::from_secs(5);
 // No fixed maximum -- an event only ends when PIR has genuinely stopped
 // (past the tail) or PSRAM fills up, however long that takes.
 
+static STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+
+const SOCKET_BUF_SIZE: usize = 4096;
+static RX_BUF: StaticCell<[u8; SOCKET_BUF_SIZE]> = StaticCell::new();
+static TX_BUF: StaticCell<[u8; SOCKET_BUF_SIZE]> = StaticCell::new();
+
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -73,6 +94,122 @@ esp_bootloader_esp_idf::esp_app_desc!();
 fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("PANIC: {info}");
     loop {}
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, Interface<'static>>) -> ! {
+    runner.run().await
+}
+
+/// What happened trying to deliver one event over WiFi -- deliberately not
+/// just "did it work", so the caller can log *why* it didn't (unreachable
+/// server vs. a mid-transfer I/O error vs. the server rejecting the request
+/// outright) without needing to re-derive that from raw response bytes
+/// itself.
+enum UploadOutcome {
+    Success,
+    /// The server responded, but not with `200` -- carries the parsed
+    /// status code (`0` if the response couldn't even be parsed that far)
+    /// for logging.
+    Rejected(u16),
+    ConnectFailed,
+    /// A write or read failed after a connection was established (e.g. the
+    /// server closed the connection mid-transfer).
+    IoError,
+}
+
+/// Uploads one event (a real JPEG thumbnail + a PSRAM-recorded video clip)
+/// as a single two-part `shared` crate event envelope, over one TCP
+/// connection, exactly the request shape `event_upload_video_test.rs`
+/// proved on real hardware. A single attempt, no retries -- retry/offline
+/// handling is deliberately later work (see `PROJECT_STATUS.md`); today the
+/// caller just needs to know whether this attempt succeeded so it can log
+/// it, since the recording itself is preserved regardless via the USB
+/// export fallback.
+#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the request header string plus the 512-byte response buffer push this over \
+    clippy's default threshold; both are short-lived, one-at-a-time, non-recursive -- the \
+    same shape already proven fine on hardware in event_upload_video_test.rs"
+)]
+async fn upload_event(
+    stack: embassy_net::Stack<'static>,
+    rx_buf: &mut [u8],
+    tx_buf: &mut [u8],
+    server_ip: IpAddress,
+    event_id: u64,
+    thumbnail: &[u8],
+    video: &[u8],
+    video_duration_ms: u32,
+) -> UploadOutcome {
+    let envelope_header = encode_envelope_header(2, event_id);
+    let thumb_header = encode_part_header(PartKind::Thumbnail, Encoding::Jpeg, 0, 0, thumbnail.len() as u32);
+    let video_header = encode_part_header(
+        PartKind::Video,
+        Encoding::RecorderFrames,
+        0,
+        video_duration_ms,
+        video.len() as u32,
+    );
+    let body_len = ENVELOPE_HEADER_LEN + PART_HEADER_LEN + thumbnail.len() + PART_HEADER_LEN + video.len();
+
+    let request_head = format!(
+        "POST /upload HTTP/1.1\r\n\
+         Host: {}.{}.{}.{}:{SERVER_PORT}\r\n\
+         X-Upload-Token: {UPLOAD_TOKEN}\r\n\
+         Content-Length: {body_len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        SERVER_IP[0], SERVER_IP[1], SERVER_IP[2], SERVER_IP[3],
+    );
+
+    let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
+    if let Err(e) = socket.connect((server_ip, SERVER_PORT)).await {
+        println!("upload: connect FAILED: {e:?}");
+        socket.abort();
+        return UploadOutcome::ConnectFailed;
+    }
+
+    let send_result: Result<(), embassy_net::tcp::Error> = async {
+        socket.write_all(request_head.as_bytes()).await?;
+        socket.write_all(&envelope_header).await?;
+        socket.write_all(&thumb_header).await?;
+        socket.write_all(thumbnail).await?;
+        socket.write_all(&video_header).await?;
+        socket.write_all(video).await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = send_result {
+        println!("upload: write FAILED: {e:?}");
+        socket.abort();
+        return UploadOutcome::IoError;
+    }
+
+    let mut resp_buf = [0u8; 512];
+    let outcome = match socket.read(&mut resp_buf).await {
+        Ok(n) if n >= 12 && &resp_buf[..12] == b"HTTP/1.1 200" => UploadOutcome::Success,
+        Ok(n) => {
+            let status_code = core::str::from_utf8(&resp_buf[..n])
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            println!(
+                "upload: server rejected the event (status {status_code}): {:?}",
+                core::str::from_utf8(&resp_buf[..n]).unwrap_or("<non-utf8>")
+            );
+            UploadOutcome::Rejected(status_code)
+        }
+        Err(e) => {
+            println!("upload: read FAILED: {e:?}");
+            UploadOutcome::IoError
+        }
+    };
+    socket.abort();
+    outcome
 }
 
 #[allow(
@@ -90,8 +227,8 @@ async fn main(spawner: Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    // Scheduler MUST start before initializing the radio.
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
-    let _ = spawner;
 
     let pir = Input::new(peripherals.GPIO21, InputConfig::default());
 
@@ -124,6 +261,42 @@ async fn main(spawner: Spawner) -> ! {
     )
     .await
     .unwrap();
+
+    let (mut wifi_controller, interfaces) =
+        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
+
+    let sta_config = WifiConfig::Station(
+        StationConfig::default()
+            .with_ssid(WIFI_SSID)
+            .with_password(WIFI_PASSWORD.into()),
+    );
+    wifi_controller.set_config(&sta_config).unwrap();
+    println!("WiFi controller started, connecting to \"{WIFI_SSID}\"...");
+
+    loop {
+        match wifi_controller.connect_async().await {
+            Ok(_) => break,
+            Err(e) => {
+                println!("WiFi connect failed: {e:?}, retrying in 5s");
+                Timer::after(Duration::from_secs(5)).await;
+            }
+        }
+    }
+    println!("WiFi connected");
+
+    let net_config = embassy_net::Config::dhcpv4(Default::default());
+    let resources = STACK_RESOURCES.init(StackResources::new());
+    let (stack, runner) = embassy_net::new(interfaces.station, net_config, resources, 0x1234_5678);
+
+    spawner.spawn(net_task(runner).unwrap());
+
+    println!("waiting for DHCP...");
+    stack.wait_config_up().await;
+    println!("DHCP done: {:?}", stack.config_v4());
+
+    let rx_buf = RX_BUF.init_with(|| [0u8; SOCKET_BUF_SIZE]);
+    let tx_buf = TX_BUF.init_with(|| [0u8; SOCKET_BUF_SIZE]);
+    let server_ip = IpAddress::v4(SERVER_IP[0], SERVER_IP[1], SERVER_IP[2], SERVER_IP[3]);
 
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).unwrap();
     let tx_config = TxChannelConfig::default()
@@ -221,13 +394,44 @@ async fn main(spawner: Spawner) -> ! {
                     }
                 }
 
-                let elapsed_secs = event_start.elapsed().as_millis() as f32 / 1000.0;
+                let event_duration_ms = event_start.elapsed().as_millis() as u32;
+                let elapsed_secs = event_duration_ms as f32 / 1000.0;
                 println!(
                     "event #{recording_count} done: {} frames, {fail_count} failures, {elapsed_secs:.2}s, {} bytes, thumbnail {thumbnail_len} bytes",
                     recorder.frame_count(),
                     recorder.bytes_used()
                 );
 
+                println!("event #{recording_count}: uploading over WiFi...");
+                match upload_event(
+                    stack,
+                    &mut *rx_buf,
+                    &mut *tx_buf,
+                    server_ip,
+                    recording_count as u64,
+                    &thumbnail_buf[..thumbnail_len],
+                    recorder.recorded_bytes(),
+                    event_duration_ms,
+                )
+                .await
+                {
+                    UploadOutcome::Success => {
+                        println!("event #{recording_count}: WiFi upload SUCCEEDED");
+                    }
+                    UploadOutcome::Rejected(code) => {
+                        println!("event #{recording_count}: WiFi upload FAILED -- server rejected it (status {code})");
+                    }
+                    UploadOutcome::ConnectFailed => {
+                        println!("event #{recording_count}: WiFi upload FAILED -- could not connect to server");
+                    }
+                    UploadOutcome::IoError => {
+                        println!("event #{recording_count}: WiFi upload FAILED -- I/O error during send/receive");
+                    }
+                }
+
+                // USB export always runs regardless of the WiFi upload
+                // outcome above -- a debugging/recovery fallback, not
+                // something the upload's success or failure should gate.
                 println!("RAW EXPORT BEGIN {}", recorder.bytes_used());
                 Printer::write_bytes(recorder.recorded_bytes());
                 println!();
