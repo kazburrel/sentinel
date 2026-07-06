@@ -16,11 +16,12 @@ async runtime via `esp-rtos`).
   printed on the camera module's ribbon cable.
 - AM312 PIR sensor, wired: `VCC→3V3`, `OUT→GPIO21`, `GND→GND`
 - Onboard WS2812 addressable RGB LED on GPIO48
-- **Built-in microSD/TF-card slot confirmed** from Freenove's board documentation.
-  It uses the ESP32-S3 SDMMC peripheral in 1-bit mode: CMD=GPIO38, CLK=GPIO39,
-  DATA0=GPIO40. The user has a 1GB card available, but it has not yet been inserted,
-  formatted, or tested with this firmware. Use FAT32 for the first test; insert/remove
-  only while the board is powered off.
+- **Built-in microSD/TF-card slot, verified working.** Uses the ESP32-S3 SDMMC
+  peripheral in 1-bit mode: CMD=GPIO38, CLK=GPIO39, DATA0=GPIO40. The user's 1GB
+  FAT32 card is inserted and has been read/written repeatedly on real hardware
+  (Milestones 17-18) via an unreleased upstream `esp-hal` fork -- see "Future
+  local fallback storage" below for the full history. Insert/remove only while
+  the board is powered off.
 - Camera pin map (confirmed correct for this board): XCLK/MCLK=15, PCLK=13, VSYNC=6,
   HREF=7, D0-D7=11,9,8,10,12,18,17,16, SCCB SDA=4, SCCB SCL=5
 - Dev machine: MacBook Pro M1 Max, macOS Darwin 25.5.0, Apple Silicon
@@ -728,13 +729,14 @@ firmware even if it turned out broken):
   delete cycle against the physical card, not a mock or a dry run.
 - **Conclusion: the onboard microSD slot is viable.** An external SPI breakout is not
   needed. The remaining risk Codex flagged -- that this requires a broad, coherent
-  pin of an entire unreleased `esp-hal` ecosystem, not a safe one-line addition -- is
-  still accurate and still applies to any future work that wires this into `main.rs`;
-  `sdmmc_test/` stays deliberately isolated until/unless that PR merges upstream or a
-  released `esp-hal` version ships this driver.
-- `sdmmc_test/` is currently untracked in git (new crate, not yet committed) --
-  `firmware/`, `server/`, `shared/`, and the root workspace are all confirmed untouched
-  by this experiment (`git status` before and after shows no changes to any of them).
+  pin of an entire unreleased `esp-hal` ecosystem, not a safe one-line addition -- was
+  accurate but has since been paid down: Milestone 17 migrated `firmware/`'s real
+  dependencies to this same pinned fork/revision and Milestone 18 wired the SD queue
+  directly into `main.rs`, both verified on real hardware.
+- `sdmmc_test/` was committed in `9292db7` (Milestone 17) as the isolated hardware
+  proof; it stays deliberately separate from `firmware/` rather than being deleted,
+  since it's the smallest possible reproduction of "does the onboard slot work at all"
+  independent of everything else in the real firmware.
 
 ## Milestone 11 — WiFi connectivity (scan + connect, verified on hardware)
 
@@ -1674,7 +1676,7 @@ always runs afterward regardless of the WiFi outcome; `RECORDING_ENABLED` flippe
 `false` to `true`. Verified on real hardware across 4 real motion events including a
 real failed-server scenario and automatic recovery once the server came back.
 
-**Uncommitted, current** (Milestone 16, described above):
+**Committed** (`0a2feb3`, Milestone 16, described above):
 - `shared/src/lib.rs` — new `EnvelopeError::EmptyPart(PartKind)`, enforced in
   `PartsIter` (`len == 0` rejected). 12 `#[cfg(test)]` unit tests (up from 11).
 - `server/src/main.rs` — new `EventDedup` (bounded/FIFO ring of recently seen
@@ -1706,6 +1708,21 @@ real failed-server scenario and automatic recovery once the server came back.
   - Module doc comment's stale "2s tail" corrected to "5s", and expanded to describe
     the background WiFi supervisor and retry behavior.
 - `NEXT_STEP.md` — untracked by design (user preference, never `git add` this file)
+
+**Committed** (`9292db7`, then `76862d1`, Milestone 17): isolated `sdmmc_test/` crate
+proving the onboard microSD slot works via an unreleased `esp-hal` fork; `firmware/`'s
+real dependencies migrated to that same pinned revision; the `esp_radio::wifi` API
+migration across 6 files; the `lto = 'thin'` fix for an LLVM backend crash the fork
+triggers on camera/DMA_CH0 binaries; new `sd_regression_test.rs` combined hardware
+regression binary; the `capture_jpeg` DMA-buffer-reuse fix in `camera.rs` (see
+Milestone 17 above for the full account).
+
+**Committed** (`1a4298a`, Milestone 18): new `firmware/src/queue.rs` (SD-backed offline
+event queue: `save_event`/`drain_queue`); `main.rs` initializes the SD card as an
+optional subsystem and wires save-on-failure/drain-on-success into the event loop;
+`server/src/main.rs`'s `EventDedup` gained `new_with_persistence` so dedup survives a
+server restart; `server/event_dedup.log` added to `.gitignore`. Verified at the
+build/test level only -- not yet a real hardware pass (see Milestone 18 above).
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
 
