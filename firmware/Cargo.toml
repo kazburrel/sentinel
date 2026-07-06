@@ -62,20 +62,32 @@ path = "./src/bin/event_upload_test.rs"
 name = "event_upload_video_test"
 path = "./src/bin/event_upload_video_test.rs"
 
+[[bin]]
+name = "sd_regression_test"
+path = "./src/bin/sd_regression_test.rs"
+
 [dependencies]
 shared = { path = "../shared" }
 
-esp-hal = { version = "~1.1.0", features = ["esp32s3", "unstable"] }
-esp-println = { version = "0.17.0", default-features = false, features = ["esp32s3", "jtag-serial", "critical-section"] }
+# Pinned to an exact, unreleased revision of an open upstream esp-hal PR
+# (esp-rs/esp-hal#5760, "SDMMC/SDIO host", branch bugadani/esp-hal:sdmmc) --
+# the only current way to drive this board's onboard microSD slot, since no
+# released esp-hal version has an SDMMC/SDIO driver at all. Proven first in
+# the fully isolated `sdmmc_test/` crate (own Cargo.lock) before migrating
+# here; see PROJECT_STATUS.md's "Future local fallback storage" section for
+# the full history, and Milestone 17 for this migration's own regression
+# testing across every firmware binary.
+esp-hal = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-hal", features = ["esp32s3", "unstable"] }
+esp-println = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-println", default-features = false, features = ["esp32s3", "jtag-serial", "critical-section"] }
 
-esp-rtos = { version = "0.3.0", features = [
+esp-rtos = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-rtos", features = [
   "embassy",
   "esp-alloc",
   "esp-radio",
   "esp32s3",
 ] }
 
-esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+esp-bootloader-esp-idf = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-bootloader-esp-idf", features = ["esp32s3"] }
 
 embassy-net = { version = "0.9.1", features = [
   "dhcpv4",
@@ -88,8 +100,17 @@ embedded-io-async = "0.7.0"
 esp-alloc = "0.10.0"
 # for more networking protocol support see https://crates.io/crates/edge-net
 embassy-executor = { version = "0.10.0", features = [] }
+embassy-futures = "0.1"
 embassy-time = "0.5.0"
-esp-radio = { version = "0.18.0", features = [
+# Also pinned to the same fork/revision as esp-hal above: the released
+# 0.18.0 requires `esp-hal ~1.1.0-rc.0` (a pre-release constraint the patched
+# fork's plain 1.1.0 can't satisfy via [patch.crates-io] alone), which forced
+# Cargo to resolve two separate esp-hal copies instead of unifying on one.
+# The fork's own esp-radio (version 1.0.0-beta.0, a real API break from
+# 0.18.0 -- see Milestone 17) references esp-hal via an in-repo relative
+# path, so pinning both to the same revision keeps everything on one
+# coherent copy.
+esp-radio = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-radio", features = [
   "esp-alloc",
   "esp32s3",
   "unstable",
@@ -111,6 +132,43 @@ smoltcp = { version = "0.13.0", default-features = false, features = [
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 
+# SDMMC/FAT dependencies, matching sdmmc_test/Cargo.toml exactly (see there
+# for why each is pinned the way it is).
+sdio = "0.4"
+embedded-fatfs = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112", default-features = false }
+embedded-partitions = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }
+block-device-adapters = "0.2.0"
+
+# The published block-device-adapters/block-device-driver don't yet have the
+# compatibility this SDMMC branch needs -- same patch sdmmc_test/Cargo.toml
+# uses, redirecting to the matching embedded-fatfs fork revision.
+#
+# xtensa-lx-rt and esp-rom-sys are also patched here (sdmmc_test/ didn't need
+# this, since it has no esp-radio dependency to conflict with): esp-radio
+# 0.18.0 pulls the released crates-io versions of these two, which both
+# `links = "..."` against the same native library the git-pinned esp-hal's
+# own copies do -- Cargo refuses two copies of a `links`-declaring crate in
+# one graph. Patching them to the same git revision unifies both dependents
+# onto one copy instead.
+#
+# esp-hal/esp-alloc/esp-println/esp-rtos/esp-bootloader-esp-idf are patched
+# here too, even though they're already direct git dependencies above --
+# esp-radio 0.18.0's own manifest references the released crates-io versions
+# of some of these transitively, and without a patch that resolves to a
+# *second*, separate copy alongside the git-pinned one instead of unifying
+# onto a single copy (surfaced as, e.g., two different `esp-hal` versions --
+# 1.1.1 from crates.io and 1.1.0 from git -- both compiling into the graph).
+[patch.crates-io]
+block-device-driver = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }
+block-device-adapters = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }
+xtensa-lx-rt = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "xtensa-lx-rt" }
+esp-rom-sys = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-rom-sys" }
+esp-hal = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-hal" }
+esp-alloc = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-alloc" }
+esp-println = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-println" }
+esp-rtos = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-rtos" }
+esp-bootloader-esp-idf = { git = "https://github.com/bugadani/esp-hal", rev = "cef6d86604d91abcf62afc9804724a637eb7af3a", package = "esp-bootloader-esp-idf" }
+
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]
@@ -121,5 +179,5 @@ opt-level = "s"
 [profile.release]
 codegen-units = 1     # LLVM can perform better optimizations using a single thread
 debug         = 2     # prefer slower builds but better debugging experience
-lto           = 'fat'
+lto           = 'thin'
 opt-level     = 's'

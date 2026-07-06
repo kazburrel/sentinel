@@ -29,7 +29,7 @@ use embedded_io_async::Write as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
-use esp_radio::wifi::{sta::StationConfig, Config as WifiConfig, Interface};
+use esp_radio::wifi::{sta::StationConfig, Config as WifiConfig, Interface, WifiController};
 use firmware::camera::CameraHandle;
 use firmware::ov3660::Framesize;
 use shared::{
@@ -59,7 +59,7 @@ static RX_BUF: StaticCell<[u8; SOCKET_BUF_SIZE]> = StaticCell::new();
 static TX_BUF: StaticCell<[u8; SOCKET_BUF_SIZE]> = StaticCell::new();
 
 #[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, Interface<'static>>) -> ! {
+async fn net_task(mut runner: Runner<'static, Interface>) -> ! {
     runner.run().await
 }
 
@@ -116,8 +116,8 @@ async fn main(spawner: Spawner) -> ! {
     };
     println!("camera initialized");
 
-    let (mut controller, interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
+    let wifi_interface = Interface::station();
+    let mut controller = WifiController::new(peripherals.WIFI, Default::default()).unwrap();
 
     let sta_config = WifiConfig::Station(
         StationConfig::default()
@@ -140,7 +140,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let net_config = embassy_net::Config::dhcpv4(Default::default());
     let resources = STACK_RESOURCES.init(StackResources::new());
-    let (stack, runner) = embassy_net::new(interfaces.station, net_config, resources, 0x1234_5678);
+    let (stack, runner) = embassy_net::new(wifi_interface, net_config, resources, 0x1234_5678);
 
     spawner.spawn(net_task(runner).unwrap());
 

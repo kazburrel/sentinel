@@ -10,6 +10,7 @@ use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use esp_radio::wifi::scan::ScanConfig;
+use esp_radio::wifi::WifiController;
 
 extern crate alloc;
 
@@ -39,8 +40,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     // Scheduler MUST start before initializing the radio.
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    let (mut controller, _interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();
+    let mut controller = WifiController::new(peripherals.WIFI, Default::default()).unwrap();
 
     loop {
         println!("scanning...");

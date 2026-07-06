@@ -1401,6 +1401,94 @@ silently and permanently unretryable.
   will need durable event identity on both sides anyway -- adding a partial persistence
   layer just for dedup now would be thrown away/reworked once that lands.
 
+## Milestone 17 — firmware migrated to the SDMMC-capable esp-hal fork; combined camera+PIR+LED+WiFi+SD hardware regression passes
+
+Followed the user's explicit corrected order after Milestone 16/`sdmmc_test/`: commit
+the isolated smoke test, migrate `firmware/`'s real dependencies to the same pinned
+revision, build every firmware binary, then hardware-regression-test camera+PIR+LED+WiFi
+with SD initialized simultaneously *before* touching the actual queue logic.
+
+- **`sdmmc_test/` committed** (`9292db7`) as the isolated hardware proof, unchanged from
+  the "Result: the onboard slot works" section above.
+- **`firmware/Cargo.toml` migrated** to the same pinned fork/revision
+  (`bugadani/esp-hal` @ `cef6d86604d91abcf62afc9804724a637eb7af3a`) for `esp-hal`,
+  `esp-println`, `esp-rtos`, `esp-bootloader-esp-idf`; added the SD/FAT dependencies
+  (`sdio`, `embedded-fatfs`/`embedded-partitions` from the `MabezDev/embedded-fatfs` fork,
+  `block-device-adapters`) and a `[patch.crates-io]` section, matching `sdmmc_test/`
+  exactly. This forced three successive dependency-graph fixes, each root-caused against
+  real error output before patching (not guessed):
+  1. **`links` conflicts** (`xtensa-lx-rt`, `esp-rom-sys`): `esp-radio 0.18.0` pulls the
+     released crates-io copies of these, which collide with the git-pinned esp-hal's own
+     copies of the same native-linked crates. Fixed by patching both to the same fork
+     revision.
+  2. **Two different esp-hal versions resolving simultaneously** (1.1.1 crates-io +
+     1.1.0 git, the crates-io copy then panicking "unstable feature required but not
+     enabled"): root-caused to `esp-radio 0.18.0`'s manifest requiring `esp-hal
+     ~1.1.0-rc.0`, a pre-release constraint that `[patch.crates-io]`'s plain `1.1.0`
+     can't satisfy, forcing Cargo to resolve a second, unpatched copy just for that one
+     dependent.
+  3. Fixing #2 required bumping `esp-radio` itself to the fork's own version
+     (`1.0.0-beta.0`, a real, if narrow, API break from the released `0.18.0`) — paused
+     here and explicitly asked the user before proceeding, since this was no longer a
+     transparent dependency-graph fix. Investigated the diff first (approved via
+     "Investigate the API diff first"), then migrated on "just go on."
+- **`esp_radio::wifi` API migration across 6 files** (`main.rs`, `wifi_test.rs`,
+  `wifi_scan_test.rs`, `http_post_test.rs`, `event_upload_test.rs`,
+  `event_upload_video_test.rs`): the free function `wifi::new(device, config) ->
+  (WifiController, Interfaces)` was replaced by `WifiController::new(device, config) ->
+  Self` + `Interface::station()`; `Interface` lost its `'static` lifetime parameter
+  (`WifiController<'d>` kept its own). Mechanical, per-file, each verified compiling
+  before moving to the next.
+- **Severe LLVM backend crash found and fixed, affecting the real production binary, not
+  just test binaries**: every camera/DMA_CH0-using binary (including `firmware` itself)
+  failed to build under the patched fork with `Cannot select: XtensaISD::PCREL_WRAPPER`
+  against `DMA_CH0::info::INFO`/the interrupt-handler symbols, but only under
+  `lto = 'fat'`. Fixed by changing `[profile.release]` to `lto = 'thin'` in
+  `firmware/Cargo.toml` — verified across all 14 binaries (`cargo build --release
+  --bins` and `cargo clippy --release --bins`, both clean).
+- **New `firmware/src/bin/sd_regression_test.rs`**: the actual gate this milestone exists
+  to pass — camera, PIR/LED, WiFi, and the onboard SD slot all initialized and running
+  simultaneously (undebounced PIR → capture-and-log on one path via `embassy_futures::
+  select`, BOOT button → the same FAT CRUD cycle as `sdmmc_test.rs` on the other), plus a
+  10s heartbeat.
+- **Real bug found and fixed during this test: `capture_jpeg` could only ever succeed
+  once per boot under the forked esp-hal.** `camera.rs`'s `capture_jpeg_with_warmup`
+  called `esp_hal::dma_rx_stream_buffer!(20 * 1000, 1000)` fresh on every capture. That
+  macro expands to a `static DESCRIPTORS: ConstStaticCell<...>` declared at the call
+  site, consumed via `.take()` — a pattern meant for one static allocation for the
+  program's entire lifetime, not a fresh call every capture. First capture's `.take()`
+  succeeds; every capture after that panics `` `ConstStaticCell` is already taken, it
+  can't be taken twice `` at the exact same source line, since it's the same static
+  instance. Root-caused by reading the macro's real expansion in the fork's
+  `esp-hal/src/dma/mod.rs` (`dma_buffers_impl!`/`dma_descriptors_impl!`), not guessed.
+  This was latent in *every* binary that calls `capture_jpeg` more than once per boot
+  (including the real `main.rs`) — it only surfaced now because `sd_regression_test.rs`
+  was the first binary actually re-run twice on hardware since the fork migration.
+  **Fixed**: `CameraHandle` now allocates the `DmaRxStreamBuf` exactly once in `new()`
+  and stores it as a field (`dma_rx_buf: Option<DmaRxStreamBuf>`), reusing the same
+  `Option::take()`/put-back pattern already used for `camera: Option<Camera<'d>>` —
+  taken out at the start of `capture_jpeg_with_warmup`, put back on every exit path
+  (`Camera::receive` failure, `DmaFinishedBeforeEof`, and the normal end of a successful
+  capture), since `CameraTransfer::stop()` returns the same `DmaRxStreamBuf` back
+  (`BUF::Final = DmaRxStreamBuf` in the fork's `DmaRxBuffer` impl).
+- **Verified on real hardware, all subsystems simultaneously active**: after reflashing
+  the fixed binary, three consecutive PIR-triggered captures all succeeded (15771,
+  17865 bytes, plus the first at 15187 bytes) with camera+PIR/LED+WiFi+SD all running —
+  no panic on the second or third capture, confirming the fix and not a fluke. The BOOT
+  button's SD path also passed: `async FAT CRUD: PASS`, the same real create/read/
+  update/read/delete cycle against the physical card, now proven while WiFi and the
+  camera are both live too, not in isolation.
+- **Step 5 of the user's corrected order (camera+PIR+LED+WiFi with SD initialized
+  simultaneously) is now genuinely passed.** Nothing in `main.rs` has been touched yet —
+  this milestone only proved the dependency migration and the SD slot are safe to build
+  on top of; the actual offline-queue logic (steps 6-7) has not started.
+- Board-history note: mid-testing, a stuck-bootloader/download-mode episode (this
+  project's known USB-Serial/JTAG quirk) was resolved by reflashing after confirming via
+  `espflash board-info` that the chip itself was reachable; separately, the board was
+  fully unplugged overnight and reconnected the next day between test sessions, which
+  explains an otherwise-confusing port-number change (`/dev/cu.usbmodem101` ->
+  `/dev/cu.usbmodem2101`) — not a new hardware fault.
+
 ## Next steps (not yet started)
 
 - **Audio part, optional, later.** `PartKind::Audio` already exists in the envelope
@@ -1667,15 +1755,22 @@ PASS` (a genuine create/read/update/read/delete cycle, not a mock). See "Future 
 fallback storage — onboard microSD" above for the full account. **The onboard slot is
 viable; no external SPI breakout is needed.**
 
-**Immediate next step**: `sdmmc_test/` is untracked and not yet committed -- decide
-whether/when to commit it (it's a working, isolated experiment, not integrated into
-`main.rs`). Then continue the recommended order: save-on-failure (queue an event as an
-envelope file on the card when upload fails) -> scan/retry queued events after reboot or
-connectivity recovery -> delete only after a confirmed `200` -> persistent server-side
-dedup keyed on `event_id` (the current `EventDedup` is RAM-only and forgets everything on
-a server restart, exactly the gap a persistent queue needs to close) -> hardware tests
-for WiFi outage, server outage, and a real ESP32 power-cycle during an outage. Battery
-work remains parked until that offline-queue testing succeeds, per the user.
+**Done (Milestone 17): `sdmmc_test/` committed, `firmware/` fully migrated to the pinned
+SDMMC-capable esp-hal fork, and the combined camera+PIR+LED+WiFi+SD hardware regression
+gate genuinely passes** -- including finding and fixing a real latent bug (`capture_jpeg`
+could only succeed once per boot post-migration; see Milestone 17 above) that hadn't
+surfaced yet because no binary had been re-run twice on hardware since the fork
+migration until this test existed.
+
+**Immediate next step**: continue the user's recommended order from here: save-on-failure
+(queue an event as an envelope file on the card when upload fails) -> scan/retry queued
+events after reboot or connectivity recovery -> delete only after a confirmed `200` ->
+persistent server-side dedup keyed on `event_id` (the current `EventDedup` is RAM-only and
+forgets everything on a server restart, exactly the gap a persistent queue needs to
+close) -> hardware tests for WiFi outage, server outage, and a real ESP32 power-cycle
+during an outage. `main.rs` itself has not been touched yet -- Milestone 17 only proved
+the migration and SD slot are safe to build the queue on top of. Battery work remains
+parked until that offline-queue testing succeeds, per the user.
 
 Also still open, lower priority: trawling GitHub issues/forums/Reddit/Discord for
 OV3660-specific community register tweaks for image quality (see "Image quality

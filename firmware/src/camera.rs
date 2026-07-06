@@ -8,6 +8,7 @@
 
 use embassy_time::{Duration, Timer};
 use esp_hal::{
+    dma::DmaRxStreamBuf,
     i2c::master::{Config as I2cConfig, I2c},
     lcd_cam::{
         cam::{self, Camera},
@@ -38,6 +39,12 @@ pub enum CameraError {
 pub struct CameraHandle<'d> {
     camera: Option<Camera<'d>>,
     _sensor: Ov3660<'d>,
+    /// Allocated once here and reused across every `capture_jpeg` call --
+    /// `dma_rx_stream_buffer!` allocates its descriptors from a
+    /// `ConstStaticCell` that can only be `take()`n once for the program's
+    /// lifetime, so calling the macro fresh on each capture panics
+    /// ("already taken") on the second call.
+    dma_rx_buf: Option<DmaRxStreamBuf>,
 }
 
 impl<'d> CameraHandle<'d> {
@@ -107,9 +114,12 @@ impl<'d> CameraHandle<'d> {
 
         sensor.init_jpeg(10, framesize).await.map_err(CameraError::I2c)?;
 
+        let dma_rx_buf = esp_hal::dma_rx_stream_buffer!(20 * 1000, 1000);
+
         Ok(Self {
             camera: Some(camera),
             _sensor: sensor,
+            dma_rx_buf: Some(dma_rx_buf),
         })
     }
 
@@ -150,12 +160,13 @@ impl<'d> CameraHandle<'d> {
         warmup_frames: u32,
     ) -> Result<usize, CameraError> {
         let camera = self.camera.take().expect("camera handle already in use");
-        let dma_rx_buf = esp_hal::dma_rx_stream_buffer!(20 * 1000, 1000);
+        let dma_rx_buf = self.dma_rx_buf.take().expect("dma rx buf already in use");
 
         let mut transfer = match camera.receive(dma_rx_buf) {
             Ok(t) => t,
-            Err((_, camera, _)) => {
+            Err((_, camera, dma_rx_buf)) => {
                 self.camera = Some(camera);
+                self.dma_rx_buf = Some(dma_rx_buf);
                 return Err(CameraError::DmaSetup);
             }
         };
@@ -167,8 +178,9 @@ impl<'d> CameraHandle<'d> {
                 let (data, ends_with_eof) = transfer.peek_until_eof();
                 if data.is_empty() {
                     if transfer.is_done() {
-                        let (camera, _) = transfer.stop();
+                        let (camera, dma_rx_buf) = transfer.stop();
                         self.camera = Some(camera);
+                        self.dma_rx_buf = Some(dma_rx_buf);
                         return Err(CameraError::DmaFinishedBeforeEof);
                     }
                 } else {
@@ -204,8 +216,9 @@ impl<'d> CameraHandle<'d> {
             }
         };
 
-        let (camera, _) = transfer.stop();
+        let (camera, dma_rx_buf) = transfer.stop();
         self.camera = Some(camera);
+        self.dma_rx_buf = Some(dma_rx_buf);
 
         result?;
         trim_to_jpeg(jpeg_buf, frame_len)
