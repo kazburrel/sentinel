@@ -259,19 +259,59 @@ fn part_file_naming(kind: PartKind) -> (&'static str, &'static str) {
 /// retries, so this is the only place that can catch the duplicate.
 ///
 /// Deliberately bounded and FIFO, not a permanent log: this only needs to
-/// cover retries arriving within roughly the same server run (seconds to
-/// minutes apart), not the server's entire lifetime, so a fixed-size ring
-/// is enough -- no database, no persistence across restarts.
+/// cover retries arriving reasonably close together, not the server's
+/// entire lifetime, so a fixed-size ring is enough -- no database. If
+/// constructed via `new_with_persistence`, the ring is also mirrored to a
+/// small file on disk (see `persist_path`), so a firmware retry landing
+/// right after a server restart is still recognized instead of being
+/// re-stored -- this is exactly the gap Milestone 16 flagged as a known
+/// limitation (dedup forgetting everything across a restart), which the
+/// SD-backed firmware queue (Milestone 17) now makes a real possibility:
+/// firmware may replay a queued event well after the server that already
+/// stored it has since restarted.
 struct EventDedup {
     seen: std::collections::VecDeque<u64>,
     capacity: usize,
+    persist_path: Option<std::path::PathBuf>,
 }
 
 impl EventDedup {
+    /// In-memory only, no persistence -- used by tests, which want a plain
+    /// `EventDedup` without touching the filesystem. Production code always
+    /// goes through `new_with_persistence` instead.
+    #[cfg(test)]
     fn new(capacity: usize) -> Self {
         Self {
             seen: std::collections::VecDeque::with_capacity(capacity),
             capacity,
+            persist_path: None,
+        }
+    }
+
+    /// Like `new`, but loads any previously recorded event IDs from `path`
+    /// (one decimal number per line) if it already exists, and keeps `path`
+    /// up to date on every subsequent `record` -- so dedup survives a
+    /// server restart, not just retries within one run. A missing or
+    /// unreadable file is treated the same as an empty one (nothing to
+    /// load yet, e.g. first run) rather than a startup failure; a
+    /// corrupted line is just skipped.
+    fn new_with_persistence(capacity: usize, path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        let mut seen = std::collections::VecDeque::with_capacity(capacity);
+        if let Ok(contents) = fs::read_to_string(&path) {
+            for line in contents.lines() {
+                if let Ok(id) = line.trim().parse::<u64>() {
+                    if seen.len() >= capacity {
+                        seen.pop_front();
+                    }
+                    seen.push_back(id);
+                }
+            }
+        }
+        Self {
+            seen,
+            capacity,
+            persist_path: Some(path),
         }
     }
 
@@ -297,6 +337,29 @@ impl EventDedup {
             self.seen.pop_front();
         }
         self.seen.push_back(event_id);
+
+        if let Some(path) = &self.persist_path
+            && let Err(e) = Self::persist(path, &self.seen)
+        {
+            println!("warning: failed to persist event dedup state to {path:?}: {e}");
+        }
+    }
+
+    /// Rewrites the persisted dedup file to exactly match `seen` -- a full
+    /// rewrite rather than an ever-growing append log, since `seen` is
+    /// already bounded to `capacity` entries (a few KB at most). Written to
+    /// a temp file and renamed into place, the same crash-safe pattern
+    /// `commit_part_file` uses, so a crash mid-write leaves the previous,
+    /// still-valid version in place rather than a half-written one.
+    fn persist(path: &std::path::Path, seen: &std::collections::VecDeque<u64>) -> std::io::Result<()> {
+        let mut contents = String::new();
+        for id in seen {
+            contents.push_str(&id.to_string());
+            contents.push('\n');
+        }
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, contents)?;
+        fs::rename(&tmp_path, path)
     }
 }
 
@@ -589,6 +652,75 @@ mod tests {
         assert!(!dedup.is_duplicate(1), "repeated checks alone must not record");
     }
 
+    fn scratch_file(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("camera_server_test_dedup_{label}_{unique}.log"))
+    }
+
+    #[test]
+    fn persistent_dedup_survives_a_simulated_restart() {
+        let path = scratch_file("restart");
+
+        let mut dedup = EventDedup::new_with_persistence(16, &path);
+        assert!(!dedup.is_duplicate(42));
+        dedup.record(42);
+        drop(dedup);
+
+        // A fresh instance pointed at the same path is a stand-in for the
+        // server process restarting -- the whole point of persistence is
+        // that this doesn't forget what the first instance already knew.
+        let dedup_after_restart = EventDedup::new_with_persistence(16, &path);
+        assert!(dedup_after_restart.is_duplicate(42), "restart must not forget a recorded event_id");
+        assert!(!dedup_after_restart.is_duplicate(99));
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persistent_dedup_starts_empty_when_no_file_exists_yet() {
+        let path = scratch_file("missing");
+        fs::remove_file(&path).ok(); // guarantee it doesn't exist
+
+        let dedup = EventDedup::new_with_persistence(16, &path);
+        assert!(!dedup.is_duplicate(1), "no prior file means nothing has been seen yet");
+    }
+
+    #[test]
+    fn persistent_dedup_respects_capacity_across_a_restart() {
+        let path = scratch_file("capacity");
+
+        let mut dedup = EventDedup::new_with_persistence(2, &path);
+        dedup.record(1);
+        dedup.record(2);
+        dedup.record(3); // evicts 1 in memory, and in the persisted file too
+        drop(dedup);
+
+        let dedup_after_restart = EventDedup::new_with_persistence(2, &path);
+        assert!(
+            !dedup_after_restart.is_duplicate(1),
+            "1 was evicted before the restart, must not reappear after loading"
+        );
+        assert!(dedup_after_restart.is_duplicate(2));
+        assert!(dedup_after_restart.is_duplicate(3));
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persistent_dedup_ignores_a_corrupted_line_instead_of_failing_to_start() {
+        let path = scratch_file("corrupt");
+        fs::write(&path, "7\nnot-a-number\n8\n").expect("scratch file should be writable");
+
+        let dedup = EventDedup::new_with_persistence(16, &path);
+        assert!(dedup.is_duplicate(7));
+        assert!(dedup.is_duplicate(8));
+
+        fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn store_event_skips_storing_a_duplicate_event_id() {
         let dir = scratch_dir("dedup");
@@ -861,12 +993,15 @@ mod tests {
 /// any realistic burst of retries for recent events without growing
 /// unbounded; see `EventDedup`.
 const EVENT_DEDUP_CAPACITY: usize = 256;
+/// Sibling to `UPLOADS_DIR`, not inside it -- this is dedup bookkeeping, not
+/// event media, and shouldn't show up mixed in with stored thumbnails/video.
+const EVENT_DEDUP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/event_dedup.log");
 
 fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", PORT))?;
     println!("listening on 0.0.0.0:{PORT} (trusted-LAN dev receiver only, see PROJECT_STATUS.md)");
 
-    let mut dedup = EventDedup::new(EVENT_DEDUP_CAPACITY);
+    let mut dedup = EventDedup::new_with_persistence(EVENT_DEDUP_CAPACITY, EVENT_DEDUP_PATH);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => handle_connection(stream, &mut dedup),

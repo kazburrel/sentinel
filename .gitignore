@@ -3,3 +3,4 @@ target/
 firmware/src/wifi_credentials.rs
 server/src/config.rs
 server/uploads/
+server/event_dedup.log

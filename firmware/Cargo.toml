@@ -135,9 +135,13 @@ static_cell      = "2.1.1"
 # SDMMC/FAT dependencies, matching sdmmc_test/Cargo.toml exactly (see there
 # for why each is pinned the way it is).
 sdio = "0.4"
-embedded-fatfs = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112", default-features = false }
+embedded-fatfs = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112", default-features = false, features = [
+  "alloc",
+  "lfn",
+] }
 embedded-partitions = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }
 block-device-adapters = "0.2.0"
+block-device-driver = "0.2.0"
 
 # The published block-device-adapters/block-device-driver don't yet have the
 # compatibility this SDMMC branch needs -- same patch sdmmc_test/Cargo.toml

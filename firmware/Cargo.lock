@@ -1038,6 +1038,7 @@ name = "firmware"
 version = "0.1.0"
 dependencies = [
  "block-device-adapters",
+ "block-device-driver",
  "critical-section",
  "embassy-executor",
  "embassy-futures",

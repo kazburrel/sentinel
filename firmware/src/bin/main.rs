@@ -22,9 +22,16 @@
 //! attempted with no connectivity just fails fast and the recording is
 //! still preserved via USB.
 //!
-//! Still not built: pre-roll before motion, and persistent offline queuing
-//! (retries only cover a single event still in memory, not one from a
-//! previous boot -- see `PROJECT_STATUS.md`).
+//! If an event's in-memory upload retries (`upload_event_with_retries`) are
+//! exhausted for any transient reason, it's saved to the onboard SD card as
+//! a queued file (`firmware::queue`) instead of being lost once its PSRAM
+//! buffers get reused by the next event. Queued files are retried whenever
+//! an upload next succeeds (proving connectivity's back) and once at boot,
+//! deleted only once the server confirms `200`. SD is optional: if the card
+//! fails to initialize, the queue is simply disabled for that boot rather
+//! than blocking camera/PIR/WiFi.
+//!
+//! Still not built: pre-roll before motion.
 
 #![no_std]
 #![no_main]
@@ -39,13 +46,14 @@ use alloc::format;
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, Runner, StackResources};
-use embassy_time::{with_timeout, Duration, Instant, Timer};
+use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 use embedded_io_async::Write as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level};
 use esp_hal::psram::{Psram, PsramConfig};
 use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
 use esp_hal::rng::Rng;
+use esp_hal::sdmmc::{Config as SdConfig, DelayPhase, SdHostController, SlotConfig};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::{println, Printer};
@@ -53,8 +61,11 @@ use esp_radio::wifi::{sta::StationConfig, Config as WifiConfig, Interface, WifiC
 use firmware::camera::CameraHandle;
 use firmware::ov3660::Framesize;
 use firmware::pir::{MotionEdge, MotionSensor};
+use firmware::queue::{self, DrainOutcome};
 use firmware::recorder::PsramRecorder;
 use firmware::ws2812::ws2812_frame;
+use sdio::sd::Card;
+use sdio::BlockDevice;
 use shared::{
     encode_envelope_header, encode_part_header, Encoding, PartKind, ENVELOPE_HEADER_LEN, PART_HEADER_LEN,
 };
@@ -112,6 +123,11 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(20);
 /// request won't change that outcome.
 const MAX_UPLOAD_ATTEMPTS: u32 = 3;
 const UPLOAD_RETRY_BACKOFF: Duration = Duration::from_secs(3);
+
+/// SD card clock/timing, matching `sd_regression_test.rs`'s already
+/// hardware-verified values for this board's onboard slot.
+const CARD_HZ: u32 = 40_000_000;
+const INPUT_DELAY_PHASE: DelayPhase = DelayPhase::_0;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -466,6 +482,63 @@ async fn main(spawner: Spawner) -> ! {
     let off = ws2812_frame(0, 0, 0);
     channel = channel.transmit(&off).unwrap().wait().unwrap();
 
+    // SD card is optional: a failure here disables the offline queue for
+    // this boot (events that fail to upload are simply not persisted
+    // locally, same as before this milestone), but must not block camera/
+    // PIR/WiFi from working -- unlike sd_regression_test.rs, which
+    // deliberately halts on SD failure since proving the slot works is its
+    // entire purpose, this is production firmware and SD is a fallback, not
+    // a dependency.
+    let sd_controller = SdHostController::new(peripherals.SDHOST, SdConfig::default()).unwrap();
+    let slot_config = SlotConfig::default().with_input_delay_phase(INPUT_DELAY_PHASE);
+    let mut sd_card: Option<BlockDevice<Card, _, _, 512>> = match sd_controller.slot::<1>(slot_config) {
+        Ok(slot) => {
+            let slot = slot
+                .with_clk(peripherals.GPIO39)
+                .with_cmd(peripherals.GPIO38)
+                .with_data0(peripherals.GPIO40)
+                .into_async();
+            match BlockDevice::new_sd_card(slot, CARD_HZ, Delay).await {
+                Ok(card) => {
+                    println!("SD card initialized: offline queue enabled");
+                    Some(card)
+                }
+                Err(e) => {
+                    println!("SD card init FAILED ({e:?}) -- offline queue disabled this boot");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            println!("SD slot config FAILED ({e:?}) -- offline queue disabled this boot");
+            None
+        }
+    };
+
+    // Catch up on anything left over from a previous boot/outage before
+    // waiting for the first new motion event -- best-effort: WiFi may not
+    // even be connected yet this early (it connects in the background), in
+    // which case this just fails fast and normal per-event draining (below)
+    // picks up the backlog once connectivity is available.
+    if let Some(card) = sd_card.as_mut() {
+        match queue::drain_queue(
+            card,
+            stack,
+            &mut *rx_buf,
+            &mut *tx_buf,
+            scratch,
+            SERVER_IP,
+            SERVER_PORT,
+            UPLOAD_TOKEN,
+        )
+        .await
+        {
+            Ok(DrainOutcome::Empty) => {}
+            Ok(outcome) => println!("queue: boot-time drain attempt: {outcome:?}"),
+            Err(e) => println!("queue: boot-time drain attempt failed: {e:?}"),
+        }
+    }
+
     let mut recording_count: u32 = 0;
     let mut motion = MotionSensor::new(pir.is_high());
     let mut last_heartbeat = Instant::now();
@@ -574,7 +647,7 @@ async fn main(spawner: Spawner) -> ! {
                     let event_id = ((boot_nonce as u64) << 32) | recording_count as u64;
                     let video_duration_ms = event_duration_ms.saturating_sub(part_timestamp_ms);
                     println!("event #{recording_count}: uploading over WiFi (event_id={event_id:#018x})...");
-                    match upload_event_with_retries(
+                    let outcome = upload_event_with_retries(
                         stack,
                         &mut *rx_buf,
                         &mut *tx_buf,
@@ -585,8 +658,9 @@ async fn main(spawner: Spawner) -> ! {
                         part_timestamp_ms,
                         video_duration_ms,
                     )
-                    .await
-                    {
+                    .await;
+
+                    match &outcome {
                         UploadOutcome::Success => {
                             println!("event #{recording_count}: WiFi upload SUCCEEDED");
                         }
@@ -601,6 +675,51 @@ async fn main(spawner: Spawner) -> ! {
                         }
                         UploadOutcome::TimedOut => {
                             println!("event #{recording_count}: WiFi upload FAILED -- timed out");
+                        }
+                    }
+
+                    if let Some(card) = sd_card.as_mut() {
+                        if matches!(outcome, UploadOutcome::Success) {
+                            // Just proved the server's reachable -- also try
+                            // to clear any backlog from an earlier outage
+                            // instead of waiting for the next event.
+                            match queue::drain_queue(
+                                card,
+                                stack,
+                                &mut *rx_buf,
+                                &mut *tx_buf,
+                                scratch,
+                                SERVER_IP,
+                                SERVER_PORT,
+                                UPLOAD_TOKEN,
+                            )
+                            .await
+                            {
+                                Ok(DrainOutcome::Empty) => {}
+                                Ok(drain_outcome) => println!("queue: {drain_outcome:?}"),
+                                Err(e) => println!("queue: drain attempt failed: {e:?}"),
+                            }
+                        } else if outcome.is_retryable() {
+                            // Attempts genuinely exhausted for now (not a
+                            // 4xx rejection, which retrying wouldn't fix
+                            // anyway) -- persist it so a later reconnect or
+                            // reboot can still deliver it instead of losing
+                            // it once these buffers are reused by the next
+                            // event.
+                            println!("event #{recording_count}: saving to SD queue for later retry...");
+                            match queue::save_event(
+                                card,
+                                event_id,
+                                &thumbnail_buf[..thumbnail_len],
+                                recorder.recorded_bytes(),
+                                part_timestamp_ms,
+                                video_duration_ms,
+                            )
+                            .await
+                            {
+                                Ok(()) => println!("event #{recording_count}: queued to SD"),
+                                Err(e) => println!("event #{recording_count}: failed to queue to SD: {e:?}"),
+                            }
                         }
                     }
                 }

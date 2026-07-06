@@ -1489,24 +1489,114 @@ with SD initialized simultaneously *before* touching the actual queue logic.
   explains an otherwise-confusing port-number change (`/dev/cu.usbmodem101` ->
   `/dev/cu.usbmodem2101`) — not a new hardware fault.
 
+## Milestone 18 — SD-backed offline event queue + persistent server-side dedup
+
+Step 6-7 of the user's corrected order, built directly on Milestone 17's proven
+migration and hardware-verified SD slot. Goal: an event that exhausts
+`upload_event_with_retries`' in-memory attempts is no longer simply lost once its
+PSRAM buffers get reused by the next motion event.
+
+- **New `firmware/src/queue.rs`** (added to the `firmware` lib crate's public
+  modules): `save_event` writes an event's exact wire-format envelope bytes (the
+  same header+parts `upload_event` would have sent) to a new SD file, and
+  `drain_queue` uploads every currently-queued file to the server, deleting each
+  one only once a `200` confirms delivery. Both dispatch over
+  `embedded_partitions::mbr::Scheme::open` the same way `sd_regression_test.rs`'s
+  FAT CRUD test already does, generic over `IO: ReadWriteSeek`, so either an
+  MBR-partitioned card or a bare superfloppy FAT volume (this board's own 1GB
+  card) works without hardcoding one layout.
+  - **Save**: written to a fixed temp name (`EVT_TMP.BIN`) first, flushed, then
+    `Dir::rename`d to its final `EVT_<event_id as 16 hex digits>.BIN` name --
+    exactly the write-then-atomically-commit pattern the server's own
+    `commit_part_file` already uses, so a power loss mid-write can never leave a
+    half-written file visible to the scan/retry pass (it's still under the temp
+    name, or doesn't exist yet). Long filenames needed enabling
+    `embedded-fatfs`'s `alloc`/`lfn` features (previously `default-features =
+    false` with neither on) -- confirmed via the crate's own source that LFN
+    directory entries are written, not just read, so this isn't a read-only
+    convenience.
+  - **Drain**: lists queued files first (name+length), *then* processes them --
+    never mutates the directory while an iterator over it is still live. Each
+    file's bytes are streamed straight from SD into the existing 64KB scratch
+    buffer and out to the socket in chunks (`Content-Length` set from the
+    file's on-disk length), never buffered whole in RAM -- the same reasoning
+    that already keeps PSRAM video clips from ever needing one giant in-memory
+    copy. A file is deleted on `200`, dropped (not kept) on an unrecoverable
+    `4xx` rejection (matching `UploadOutcome::is_retryable()`'s existing
+    philosophy -- retrying an identical malformed request forever would
+    otherwise block every file queued behind it), and left in place with the
+    whole pass stopped early on any transient failure (no connection, timeout,
+    I/O error, or `5xx`), on the assumption the server/WiFi is still down and
+    hammering through the rest of the queue this pass won't help.
+- **`firmware/src/bin/main.rs`** now initializes the SD card at boot (same proven
+  `SdHostController`/`slot::<1>`/`BlockDevice::new_sd_card` sequence as
+  `sd_regression_test.rs`), but as `Option<BlockDevice<...>>` rather than halting
+  on failure -- unlike the regression test (whose entire purpose is proving the
+  slot works), production firmware must keep camera/PIR/WiFi working even if the
+  card is missing or fails to init; the queue is just disabled for that boot.
+  Wired into the event loop: after `upload_event_with_retries` returns,
+  `UploadOutcome::Success` triggers a best-effort `queue::drain_queue` (since
+  connectivity's just been proven), and any retryable non-success
+  (`is_retryable()`, i.e. not a `4xx` rejection) triggers `queue::save_event`.
+  Also attempts one best-effort `queue::drain_queue` right at boot, before the
+  first motion event, to catch up on a backlog left over from a previous
+  outage/reboot without waiting for new motion (WiFi may not have connected yet
+  this early since it connects in the background -- this attempt just fails
+  fast in that case, and normal per-event draining picks up the backlog once
+  connectivity exists).
+- **`firmware/Cargo.toml`**: added `block-device-driver` as a direct dependency
+  (previously only pulled in transitively, so `[patch.crates-io]` had nothing at
+  the top level to redirect for `queue.rs`'s own `use` of it) and enabled
+  `embedded-fatfs`'s `alloc`/`lfn` features.
+- **`server/src/main.rs`**: `EventDedup` gained `new_with_persistence(capacity,
+  path)`, loading previously recorded event IDs from a small file (one decimal
+  number per line) if present, and rewriting that file (temp-file-then-rename,
+  the same crash-safe pattern as `commit_part_file`) on every `record()` --
+  closing the exact gap Milestone 16 flagged as a known limitation (dedup
+  forgetting everything on a server restart), which the SD queue now makes a
+  real, not just theoretical, scenario: a queued event can plausibly be replayed
+  well after the server that already stored it has since restarted. Plain
+  `new(capacity)` (in-memory only) is kept but now `#[cfg(test)]`-gated, since
+  production code (`main()`) always goes through the persistent constructor.
+  The dedup file lives at `server/event_dedup.log` (sibling to `uploads/`, added
+  to `.gitignore`), bounded to `EVENT_DEDUP_CAPACITY` entries same as before --
+  a full rewrite per record rather than an ever-growing append log, since the
+  bounded ring is only a few KB even at capacity.
+- **4 new `server` tests** (21 total, up from 17): a simulated restart (two
+  `EventDedup` instances pointed at the same path) confirms a recorded ID
+  survives; starting with no existing file behaves like starting empty;
+  capacity eviction is confirmed to persist correctly across a restart (an
+  evicted ID doesn't reappear after reloading); a corrupted line in the file
+  is skipped rather than failing startup.
+- **Verified**: `cargo build --release --bins` and `cargo clippy --release
+  --bins` clean across all 14 firmware binaries (`queue.rs` is a new lib
+  module, not a new binary); `cargo test -p server -p shared` -- 33 tests
+  total (21 server + 12 shared), all passing.
+- **Not yet verified on real hardware** -- this milestone was implemented and
+  fully verified at the build/test level, but the actual WiFi-outage /
+  server-outage / reboot-recovery scenarios described in the user's original
+  plan (insert card, save on failure, retry after reboot/reconnect, delete only
+  after `200`, persistent dedup) still need a real hardware pass: kill the
+  server mid-event to force a save, confirm the file appears on the card,
+  bring the server back and confirm the next event (or a reboot) drains and
+  deletes it, and confirm a server restart between those steps doesn't cause a
+  duplicate store. Battery work remains parked until this hardware pass
+  succeeds, per the user's standing instruction.
+
 ## Next steps (not yet started)
 
 - **Audio part, optional, later.** `PartKind::Audio` already exists in the envelope
   (reserved, unused) -- add it only once there's an actual audio source to capture;
   the wire format and server storage path need no changes to support it when that
   happens.
-- **Persistent offline queue, now the immediate next step.** Milestone 16 added bounded
-  in-memory retries (3 attempts, 3s backoff) and reboot-safe event IDs; a post-review fix
-  made the server's `EventDedup` actually safe to retry against (it no longer marks an
-  `event_id` seen until the event is fully committed). But an event that exhausts all 3
-  attempts (e.g. a server or WiFi outage lasting more than ~10-15s) is still simply lost
-  from the server's perspective once that event's thumbnail/video buffers get reused by
-  the next motion event -- USB export is still the only durable fallback. `EventDedup`
-  itself is also still in-memory only (a server restart forgets every recorded
-  `event_id`); the future persistent queue should bring durable event identity on both
-  sides together, rather than patching dedup persistence in on its own first. Next: a
-  persistent local queue (onboard microSD, see below) so an event surviving a longer
-  outage can be retried later instead of only right after recording.
+- **Persistent offline queue: implemented (Milestone 18), needs its real hardware pass.**
+  `firmware::queue` now saves an event to the SD card when `upload_event_with_retries`
+  exhausts its attempts, and drains (uploads + deletes-on-`200`) the queue at boot and
+  after every successful live upload; `EventDedup` on the server now persists across
+  restarts too. What's left is the actual hardware verification (kill the server mid-event,
+  confirm the save, bring it back, confirm drain-and-delete, confirm no duplicate store
+  across a server restart) -- see Milestone 18's own "not yet verified on real hardware"
+  note above.
 - Build out the `server` crate's request routing beyond the single `POST /upload`
   endpoint (structured per-part storage is now done, per Milestone 14) once there's an
   actual second concern to route to (e.g. an AI-processing trigger or a query endpoint).
@@ -1522,10 +1612,6 @@ with SD initialized simultaneously *before* touching the actual queue logic.
   JPEG quality — all cheap, safe, no code written yet pending user direction.
 - Optionally hand the community/undocumented-tricks research (image quality
   investigation, point 7) to Codex.
-- **Later: onboard microSD offline queue/fallback.** After WiFi upload and server
-  acknowledgement are reliable, test the user's 1GB FAT32 card through the built-in
-  1-bit SDMMC slot (GPIO38/39/40), then add save-on-upload-failure and delete-on-ack
-  behavior. Do not mix this into the initial HTTP proof-of-concept.
 - `FOR_CODEX.md`'s original content (UPDATE 1-8) can likely be deleted entirely now —
   it documents a hang that was never real, and is superseded by this file.
 
@@ -1762,15 +1848,26 @@ could only succeed once per boot post-migration; see Milestone 17 above) that ha
 surfaced yet because no binary had been re-run twice on hardware since the fork
 migration until this test existed.
 
-**Immediate next step**: continue the user's recommended order from here: save-on-failure
-(queue an event as an envelope file on the card when upload fails) -> scan/retry queued
-events after reboot or connectivity recovery -> delete only after a confirmed `200` ->
-persistent server-side dedup keyed on `event_id` (the current `EventDedup` is RAM-only and
-forgets everything on a server restart, exactly the gap a persistent queue needs to
-close) -> hardware tests for WiFi outage, server outage, and a real ESP32 power-cycle
-during an outage. `main.rs` itself has not been touched yet -- Milestone 17 only proved
-the migration and SD slot are safe to build the queue on top of. Battery work remains
-parked until that offline-queue testing succeeds, per the user.
+**Done (Milestone 18): the SD-backed offline queue and persistent server-side dedup are
+implemented, building directly on Milestone 17's proven migration.** `firmware::queue`
+saves an event's exact envelope bytes to the SD card (atomically, via a temp-name-then-
+rename) whenever `upload_event_with_retries` exhausts its attempts for a transient reason,
+and drains (uploads + deletes-on-`200`) the queue both at boot and after every successful
+live upload. `main.rs` now initializes the SD card as an optional subsystem -- a missing
+or failed card just disables the queue for that boot rather than blocking camera/PIR/WiFi.
+`EventDedup` on the server gained `new_with_persistence`, closing the exact "forgets
+everything on restart" gap Milestone 16 flagged, which the SD queue makes a real scenario
+(a queued event can be replayed well after a server restart). All build/test-level
+verification passes (14 firmware binaries build+clippy clean, 33 host tests pass, 4 new),
+but **this has not yet been tested on real hardware.**
+
+**Immediate next step**: the hardware pass this milestone still needs, per the user's
+original order -- kill the server mid-event to force a real save-to-SD, confirm the queued
+file's presence, bring the server back and confirm the next event (or a reboot) actually
+drains and deletes it, and confirm a server restart in between doesn't cause a duplicate
+store. Also worth confirming behavior with the card removed/failing (queue should just be
+disabled, not block recording). Battery work remains parked until this hardware pass
+succeeds, per the user.
 
 Also still open, lower priority: trawling GitHub issues/forums/Reddit/Discord for
 OV3660-specific community register tweaks for image quality (see "Image quality
