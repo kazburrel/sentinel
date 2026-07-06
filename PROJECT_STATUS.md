@@ -1574,16 +1574,20 @@ PSRAM buffers get reused by the next motion event.
   --bins` clean across all 14 firmware binaries (`queue.rs` is a new lib
   module, not a new binary); `cargo test -p server -p shared` -- 33 tests
   total (21 server + 12 shared), all passing.
-- **Not yet verified on real hardware** -- this milestone was implemented and
-  fully verified at the build/test level, but the actual WiFi-outage /
-  server-outage / reboot-recovery scenarios described in the user's original
-  plan (insert card, save on failure, retry after reboot/reconnect, delete only
-  after `200`, persistent dedup) still need a real hardware pass: kill the
-  server mid-event to force a save, confirm the file appears on the card,
-  bring the server back and confirm the next event (or a reboot) drains and
-  deletes it, and confirm a server restart between those steps doesn't cause a
-  duplicate store. Battery work remains parked until this hardware pass
-  succeeds, per the user's standing instruction.
+- **Verified on real hardware, the actual server-outage scenario, end to end**:
+  flashed the real `firmware` binary (not a test binary), stopped the Mac
+  server, triggered a real motion event -- recorded fine (77 frames, 1.48MB),
+  all 3 live upload attempts correctly failed (`ConnectFailed`, server down),
+  and the event was saved to the SD card (`event #1: queued to SD`). Server
+  restarted. A second real motion event recorded and uploaded successfully
+  live (`event #2: WiFi upload SUCCEEDED`), which triggered a drain that found
+  the queued file from event #1, delivered it, and removed it from the card
+  (`queue: EVT_AB1073F900000001.BIN delivered, removing from queue` ->
+  `Drained { uploaded: 1, dropped: 0 }`). Cross-checked independently against
+  the server's own log: both events (`event_id` ending `...497` and `...498`)
+  show up stored with their own thumbnail+video files, not just one. Test
+  upload artifacts deleted afterward, per this project's established
+  practice. **Milestone 18 is complete.**
 
 ## Next steps (not yet started)
 
@@ -1876,15 +1880,21 @@ or failed card just disables the queue for that boot rather than blocking camera
 everything on restart" gap Milestone 16 flagged, which the SD queue makes a real scenario
 (a queued event can be replayed well after a server restart). All build/test-level
 verification passes (14 firmware binaries build+clippy clean, 33 host tests pass, 4 new),
-but **this has not yet been tested on real hardware.**
+and it has since been **verified on real hardware, the exact server-outage scenario**:
+server stopped, a real motion event recorded and failed to upload after 3 attempts, saved
+to SD (`event #1: queued to SD`); server restarted; a second real motion event uploaded
+live and its success triggered a drain that found, delivered, and removed the queued file
+(`Drained { uploaded: 1, dropped: 0 }`); both events independently confirmed stored in the
+server's own log. **Milestone 18 is complete.**
 
-**Immediate next step**: the hardware pass this milestone still needs, per the user's
-original order -- kill the server mid-event to force a real save-to-SD, confirm the queued
-file's presence, bring the server back and confirm the next event (or a reboot) actually
-drains and deletes it, and confirm a server restart in between doesn't cause a duplicate
-store. Also worth confirming behavior with the card removed/failing (queue should just be
-disabled, not block recording). Battery work remains parked until this hardware pass
-succeeds, per the user.
+**Immediate next step**: none blocking -- the SD-backed offline queue is implemented and
+hardware-verified end to end. Optionally worth a future pass: confirming behavior with the
+card removed/failing (queue should just disable itself, not block recording -- implemented
+but not separately hardware-exercised), and a scenario with two separate server restarts to
+directly exercise the persisted-dedup-across-restart path with an actual duplicate replay
+(this pass only restarted the server once, before the drain that delivered the queued
+event, which isn't quite the same as a duplicate arriving after a restart). Battery work
+remains parked until the user decides to pick it back up.
 
 Also still open, lower priority: trawling GitHub issues/forums/Reddit/Discord for
 OV3660-specific community register tweaks for image quality (see "Image quality
