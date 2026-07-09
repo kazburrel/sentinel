@@ -1662,6 +1662,19 @@ JPEG thumbnail firmware already sends in every event envelope needed nothing new
   the real board's) cleaned up afterward, per this project's established practice;
   a handful of harmless test `event_id`s remain in the bounded/FIFO
   `event_dedup.log` (never collide with real event IDs, age out naturally).
+- **User live-tested repeated real `analysis.json` outputs from `server/uploads/`**:
+  several fresh events were inspected with
+  `cat "$(ls -t server/uploads/*_analysis.json | head -1)"`. Results matched the
+  intended production shape every time: `event_analysis` was populated,
+  `identity.status` stayed `"not_enabled"` with all identity fields `null`, and
+  `ai.provider = "ollama"`, `ai.model = "qwen3.5:4b"`, `ai.status = "success"`.
+  The model correctly produced different practical classifications across real live
+  samples: package-like close-up label/item (`package: true`, `importance: medium`);
+  multiple person/close-to-camera cases (`person: true`, usually
+  `importance: high`); and a dark/blurred no-subject frame (`person/package/vehicle/animal:
+  false`, `importance: low`). This confirms the AI integration is not only a synthetic
+  test harness result -- it is producing saved analysis files from the live camera
+  event flow.
 - `cargo test -p server` -- 27 tests, all passing. `cargo clippy -p server` clean.
   Firmware entirely untouched (`git diff --stat -- firmware/` empty) -- confirmed
   before and after, per the explicit scope instruction.
@@ -1673,8 +1686,69 @@ JPEG thumbnail firmware already sends in every event envelope needed nothing new
   anywhere (Ollama/model installation stays a deployment concern, not application
   code).
 
+## Milestone 20 — server-side retention cleanup
+
+Event files under `server/uploads/` were never deleted on their own; this milestone
+adds a background sweep that removes complete old event sets after
+`EVENT_RETENTION_DAYS` (default 30), so the directory doesn't grow forever on the
+Mac/mini-computer. Scoped entirely to the `server` crate -- no firmware changes, and
+the ESP32 SD-card offline queue (`firmware::queue`) is completely separate on-device
+storage that this never touches.
+
+- **New `server/src/retention.rs`**: `clean_expired_events(dir, retention, now)` scans
+  `UPLOADS_DIR`, groups files by their `event_<timestamp>` prefix (the same naming
+  `commit_part_file`/`ai::analyze_and_save` already use -- `event_<timestamp>_
+  thumbnail.jpg`, `_video.bin`, `_analysis.json`, and any hard-link collision-suffixed
+  variant like `_thumbnail_1.jpg`, all grouped under one key), and deletes every file
+  in a group together, only once the *most recently modified* file in that group is
+  itself older than the retention window.
+- **Why "most recently modified", not "oldest"**: this is what makes the sweep safe
+  against a set that's still being assembled -- e.g. `analysis.json` can land many
+  seconds (or, if Ollama is slow, longer) after the thumbnail/video are already
+  committed. Checking the newest member's age means a set is never touched while any
+  part of it is fresh, satisfying "don't delete anything still being uploaded or
+  written" by construction rather than by a separate special case. Proved directly by
+  a test (`never_partially_deletes_a_set_still_gaining_files`) that backdates a
+  thumbnail+video past retention but leaves `analysis.json` fresh, and confirms
+  nothing is deleted.
+- **Deliberately narrow file matching**: `event_key` only recognizes this server's own
+  `event_<digits>_...` scheme -- anything else (a stray `.tmp_*` file from an
+  interrupted commit, `event_dedup.log`, a user-dropped file, even a name that merely
+  starts with `event_` but isn't followed by a pure-digit timestamp) is left
+  completely alone, never considered for deletion at all.
+- **Runs on its own detached background thread**, started once at boot alongside the
+  AI analyzer -- same reasoning as `ai::analyze_and_save`'s background thread: this
+  server's accept loop is single-threaded and synchronous, so a sweep (even a cheap
+  one) must never be able to delay accepting an upload. Sweeps immediately at startup
+  (catches anything that expired while the server was down), then every
+  `RETENTION_SWEEP_INTERVAL` (1 hour -- far more granular than a day-scale retention
+  window needs, but the sweep itself is just a directory listing + stat calls, so the
+  cost is negligible).
+- **`EVENT_RETENTION_DAYS` env var**, default `30`, read once at startup via
+  `retention::retention_from_env()` -- unset or unparseable falls back to the default
+  rather than failing startup.
+- **8 new tests** (server now 35, up from 27): deletes a fully-expired set together;
+  keeps a set that hasn't aged out; never partially deletes a set still gaining files
+  (above); never touches files outside the naming scheme (`README.txt`, a `.tmp_*`
+  file, `event_notes.md`, `eventually_something.jpg` -- all survive even when
+  backdated 10x past retention); groups a hard-link collision suffix into the same
+  set; two different events' expiry are independent of each other; a missing
+  `UPLOADS_DIR` is not an error (just nothing to clean up yet); `event_key`'s
+  matching logic directly.
+- `cargo test -p server` -- 35 tests, all passing. `cargo clippy -p server` clean.
+  Firmware entirely untouched (`git diff --stat -- firmware/` empty), confirmed.
+- **Not yet verified with a real long-running server** (only unit-tested with
+  synthetic backdated files) -- the sweep logic itself is proven, but nobody has yet
+  watched it actually run against `server/uploads/`'s real event files over a real
+  hourly cycle. Low risk (same file-age-comparison logic either way), but flagged
+  here per this project's practice of being explicit about what's test-verified vs.
+  hardware/real-process-verified.
+
 ## Next steps (not yet started)
 
+- **Server-side retention cleanup: complete (Milestone 20).** Verified with unit
+  tests (synthetic backdated files); not yet observed running against real event
+  files over a real multi-hour/day server lifetime. Low risk, not blocking anything.
 - **AI thumbnail analysis: complete (Milestone 19).** Verified end-to-end against a
   real running Ollama instance, including the offline/failure path. Natural future
   extensions, not started: the known-person-recognition module the `identity` block
@@ -1812,13 +1886,20 @@ optional subsystem and wires save-on-failure/drain-on-success into the event loo
 server restart; `server/event_dedup.log` added to `.gitignore`. Verified at the
 build/test level only -- not yet a real hardware pass (see Milestone 18 above).
 
-**Uncommitted, current** (Milestone 19, described above): new `server/src/ai.rs`
+**Committed** (`85e1cf8`, then `7c9463f`, Milestone 19): new `server/src/ai.rs`
 (`ThumbnailAnalyzer` trait, `OllamaAnalyzer`, `EventAnalysis`/`Identity`/`AiMeta`/
 `AnalysisResult`, `analyze_and_save`); `server/src/main.rs` adds `mod ai;`, threads an
 `Arc<dyn ThumbnailAnalyzer>` through `process_request`/`handle_connection`/`main`, and
 spawns a detached background thread per event for the analysis call (never in-line,
 per the single-threaded-accept-loop finding above); `server/Cargo.toml` gained `ureq`
-(`json` feature), `serde`/`serde_json`, `base64`. `firmware/` untouched.
+(`json` feature), `serde`/`serde_json`, `base64`; new `scripts/send_test_event.py` dev
+tool. `firmware/` untouched.
+
+**Uncommitted, current** (Milestone 20, described above): new `server/src/retention.rs`
+(`clean_expired_events`, `event_key`, `retention_from_env`); `server/src/main.rs` adds
+`mod retention;` and spawns a second detached background thread at startup for the
+hourly sweep, alongside the existing AI-analysis and WiFi-independent design
+philosophy of never blocking the single-threaded accept loop. `firmware/` untouched.
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
 

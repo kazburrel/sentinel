@@ -27,6 +27,7 @@
 
 mod ai;
 mod config;
+mod retention;
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -1030,6 +1031,11 @@ const EVENT_DEDUP_CAPACITY: usize = 256;
 /// Sibling to `UPLOADS_DIR`, not inside it -- this is dedup bookkeeping, not
 /// event media, and shouldn't show up mixed in with stored thumbnails/video.
 const EVENT_DEDUP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/event_dedup.log");
+/// How often the retention sweep re-checks `UPLOADS_DIR` -- cheap (just a
+/// directory listing + stat calls), so an hourly cadence is far more
+/// granular than needed for a day-scale retention window while still
+/// keeping old events from lingering long after they expire.
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", PORT))?;
@@ -1041,6 +1047,26 @@ fn main() -> std::io::Result<()> {
     // event's background analysis thread (see `process_request`) can share
     // it without cloning the underlying config/HTTP setup per event.
     let analyzer: Arc<dyn ai::ThumbnailAnalyzer> = Arc::new(ai::OllamaAnalyzer::from_env(AI_ANALYSIS_TIMEOUT));
+
+    // Runs independently of the accept loop below, for the same reason the
+    // AI analysis call is never in-line: this server is single-threaded
+    // and synchronous, so a sweep must never be able to delay accepting an
+    // upload. Sweeps immediately on startup (catching anything that
+    // expired while the server was down), then on `RETENTION_SWEEP_INTERVAL`.
+    let retention_duration = retention::retention_from_env();
+    println!(
+        "retention: deleting event sets older than {:.1} day(s) (EVENT_RETENTION_DAYS)",
+        retention_duration.as_secs_f64() / 86400.0
+    );
+    std::thread::spawn(move || loop {
+        match retention::clean_expired_events(Path::new(UPLOADS_DIR), retention_duration, SystemTime::now()) {
+            Ok(0) => {}
+            Ok(n) => println!("retention: removed {n} expired event set(s)"),
+            Err(e) => println!("retention: sweep failed: {e}"),
+        }
+        std::thread::sleep(RETENTION_SWEEP_INTERVAL);
+    });
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => handle_connection(stream, &mut dedup, &analyzer),
