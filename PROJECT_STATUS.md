@@ -1737,18 +1737,87 @@ storage that this never touches.
   matching logic directly.
 - `cargo test -p server` -- 35 tests, all passing. `cargo clippy -p server` clean.
   Firmware entirely untouched (`git diff --stat -- firmware/` empty), confirmed.
-- **Not yet verified with a real long-running server** (only unit-tested with
-  synthetic backdated files) -- the sweep logic itself is proven, but nobody has yet
-  watched it actually run against `server/uploads/`'s real event files over a real
-  hourly cycle. Low risk (same file-age-comparison logic either way), but flagged
-  here per this project's practice of being explicit about what's test-verified vs.
-  hardware/real-process-verified.
+- **Real-process smoke-tested, but not long-run aged-out verified yet**: a real
+  restart of the running server confirmed the retention sweep thread starts cleanly
+  and correctly leaves the current recent upload set alone (137 real event files at
+  the time of the test). The actual deletion path is unit-tested with synthetic
+  backdated files, but nobody has yet watched it delete naturally aged-out real files
+  over a real 30-day server lifetime. Low risk (same file-age-comparison logic either
+  way), but flagged here per this project's practice of being explicit about what's
+  test-verified vs. long-run/real-data verified.
+
+## Milestone 21 — server-side key-frame extraction from recorded video
+
+Closes the candidate noted after Milestone 20: uploaded video clips were still only
+the raw `firmware::recorder::PsramRecorder` wire format (`[frame_len][timestamp_ms]
+[jpeg]` repeated) -- viewable only through this project's existing decode/assemble
+scripts. Chose key-frame extraction over a full container conversion (the other
+option the candidate note offered): no `ffmpeg`/external-process dependency, no new
+failure surface from a tool that might not be installed, and a handful of
+representative stills is a better fit for "server/AI can consume this" than a
+full replayable video -- the explicit motivation given for this milestone. Full
+container conversion (MJPEG/AVI or similar) remains available as a later option if
+key frames turn out to be insufficient once real video-AI work starts.
+
+- **New `server/src/video.rs`**: `extract_keyframes(video_path)` reads a stored
+  `event_<timestamp>_video.bin`, parses every frame with the same `[frame_len: u32
+  LE][timestamp_ms: u32 LE][jpeg bytes]` logic `scripts/decode_raw_capture.py`
+  already uses for the USB-export path (the network-uploaded `.bin` file is that
+  same byte sequence directly, no enclosing marker), and writes up to
+  `MAX_KEYFRAMES` (6) representative stills as `event_<timestamp>_keyframe_<n>.jpg`
+  beside it -- always including the first and last frame, evenly spaced in between;
+  a clip with 6 or fewer frames keeps all of them.
+  - **Free interoperability with Milestone 20's retention cleanup, no changes needed
+    there**: `retention::event_key` already groups purely by the `event_<timestamp>`
+    prefix regardless of what follows, so `_keyframe_<n>.jpg` files are
+    automatically swept up together with the rest of an expired event set.
+  - **Never touches the original `.bin`** -- only ever adds new files alongside it,
+    matching "keep the raw file until conversion is trusted." A path that doesn't
+    match the expected `..._video.bin` naming, a missing file, or malformed/truncated
+    frame data is logged and simply results in zero keyframes written -- never a
+    panic, never anything that could affect the upload.
+- **Same detached-background-thread treatment as AI analysis**, wired into
+  `process_request` right alongside it: after the response is already flushed, if a
+  `Video` part was stored this request, a `std::thread::spawn` reads and processes it
+  independently -- this server's accept loop is single-threaded, so extraction (like
+  analysis) must never run in-line or it would block the next upload from being
+  accepted.
+- **9 new tests** (server now 44, up from 35): correct frame parsing; rejects an
+  empty buffer and a truncated final frame; keeps every frame when at/under the
+  6-frame cap; thins a 50-frame synthetic clip down to 6, keeping the first and last;
+  a real end-to-end write test (encodes 3 synthetic frames, calls
+  `extract_keyframes`, confirms exactly the right files appear, the original `.bin`
+  is byte-for-byte untouched, and a specific keyframe's content matches the source
+  frame exactly); writes nothing (no panic) when the source is malformed, missing,
+  or doesn't match the expected naming.
+- **Verified end-to-end against a real stored clip, not just synthetic tests**: sent
+  a real thumbnail + a real, previously-recorded 71-frame/~1.4MB video part (reused
+  from an actual earlier firmware upload) through the running release server.
+  Response returned in ~20ms regardless of the ~1.4MB video part. Log confirmed
+  `video: extracted 6/6 keyframe(s) ... (71 total frame(s), timestamps [112, 2020,
+  3281, 4614, 6162, 7387]ms)` -- extraction is running concurrently with (not gating)
+  the AI thumbnail analysis, which also completed normally on the same event.
+  Confirmed all 6 `_keyframe_N.jpg` files are real, valid 640x480 JPEGs
+  (`file` reported `JPEG image data, ... 640x480, components 3` for each), and the
+  original `_video.bin` was confirmed byte-identical before/after. Test artifacts
+  cleaned up afterward, per this project's established practice.
+- `cargo test -p server` -- 44 tests, all passing. `cargo clippy -p server` clean.
+  Firmware entirely untouched (`git diff --stat -- firmware/` empty), confirmed.
+- **Deliberately not done**: no video AI analysis yet (still thumbnail-only, per
+  explicit instruction) -- these key frames exist so that work has something ready
+  to consume once it starts, not to trigger it now. No full container/MJPEG-AVI
+  conversion either, per the design choice above.
 
 ## Next steps (not yet started)
 
-- **Server-side retention cleanup: complete (Milestone 20).** Verified with unit
-  tests (synthetic backdated files); not yet observed running against real event
-  files over a real multi-hour/day server lifetime. Low risk, not blocking anything.
+- **Server-side key-frame extraction: complete (Milestone 21).** Verified against a
+  real stored clip (not just synthetic tests). Sets up video-AI work for later
+  (still explicitly deferred) without doing any of it yet.
+- **Server-side retention cleanup: complete (Milestone 20).** Committed in `8ff4e1c`.
+  Verified with unit tests (synthetic backdated files) plus a real server restart
+  smoke test that left all 137 recent real event files alone. Not yet observed
+  deleting naturally aged-out real files over a real 30-day lifetime; low risk, not
+  blocking anything.
 - **AI thumbnail analysis: complete (Milestone 19).** Verified end-to-end against a
   real running Ollama instance, including the offline/failure path. Natural future
   extensions, not started: the known-person-recognition module the `identity` block
@@ -1895,11 +1964,22 @@ per the single-threaded-accept-loop finding above); `server/Cargo.toml` gained `
 (`json` feature), `serde`/`serde_json`, `base64`; new `scripts/send_test_event.py` dev
 tool. `firmware/` untouched.
 
-**Uncommitted, current** (Milestone 20, described above): new `server/src/retention.rs`
+**Committed** (`8ff4e1c`, Milestone 20): new `server/src/retention.rs`
 (`clean_expired_events`, `event_key`, `retention_from_env`); `server/src/main.rs` adds
 `mod retention;` and spawns a second detached background thread at startup for the
 hourly sweep, alongside the existing AI-analysis and WiFi-independent design
-philosophy of never blocking the single-threaded accept loop. `firmware/` untouched.
+philosophy of never blocking the single-threaded accept loop. `server` now has 35
+tests passing; `cargo clippy -p server` clean; `firmware/` untouched. A real restart
+of the running server confirmed the sweep starts cleanly and leaves recent real
+events alone.
+
+**Uncommitted, current** (Milestone 21, described above): new `server/src/video.rs`
+(`extract_keyframes`, frame parsing, `MAX_KEYFRAMES`-based even-spacing selection);
+`server/src/main.rs` spawns a third kind of detached background thread in
+`process_request` (alongside AI analysis) whenever a `Video` part was stored this
+request. `server` now has 44 tests passing; `cargo clippy -p server` clean;
+`firmware/` untouched. Verified against a real, previously-recorded 71-frame clip
+sent through the running release server, not just synthetic tests.
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
 

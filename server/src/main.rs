@@ -28,6 +28,7 @@
 mod ai;
 mod config;
 mod retention;
+mod video;
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -524,6 +525,16 @@ fn process_request(
         let analyzer = Arc::clone(analyzer);
         std::thread::spawn(move || {
             ai::analyze_and_save(analyzer.as_ref(), Path::new(&thumbnail_path), Path::new(&analysis_path));
+        });
+    }
+
+    // Same reasoning, same detached-thread treatment: key-frame extraction
+    // reads the just-stored video part but never touches or gates the
+    // upload response, and only ever adds new files alongside it.
+    if let Some(video_path) = filenames.iter().find(|f| f.ends_with("_video.bin")) {
+        let video_path = video_path.clone();
+        std::thread::spawn(move || {
+            video::extract_keyframes(Path::new(&video_path));
         });
     }
 
