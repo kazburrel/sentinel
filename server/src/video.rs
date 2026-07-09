@@ -22,7 +22,7 @@
 //! modifies it.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// How many key frames to pull out of one clip, evenly spaced across the
 /// whole recording (including the first and last frame). Deliberately
@@ -96,21 +96,25 @@ fn select_keyframes<'a, 'b>(frames: &'b [Frame<'a>]) -> Vec<&'b Frame<'a>> {
 /// once it expires, with no changes needed there. Never returns an error
 /// or panics -- every failure (unreadable file, malformed frames, a path
 /// that doesn't match the expected naming) is logged and just means no
-/// keyframes get written; see the module doc for why.
-pub fn extract_keyframes(video_path: &Path) {
+/// keyframes get written; see the module doc for why. Returns the paths
+/// that were actually written (possibly empty on any failure), so a
+/// caller -- `ai::analyze_and_save`, via `main.rs` -- knows exactly what's
+/// available to analyze alongside the thumbnail; an empty result is a
+/// normal, expected input there, not an error to propagate.
+pub fn extract_keyframes(video_path: &Path) -> Vec<PathBuf> {
     let Some(stem) = video_path.to_str().and_then(|s| s.strip_suffix("_video.bin")) else {
         println!(
             "video: {} doesn't match the expected *_video.bin naming, skipping",
             video_path.display()
         );
-        return;
+        return Vec::new();
     };
 
     let raw = match fs::read(video_path) {
         Ok(bytes) => bytes,
         Err(e) => {
             println!("video: failed to read {}: {e}", video_path.display());
-            return;
+            return Vec::new();
         }
     };
 
@@ -118,26 +122,28 @@ pub fn extract_keyframes(video_path: &Path) {
         Ok(frames) => frames,
         Err(e) => {
             println!("video: failed to parse frames from {}: {e:?}", video_path.display());
-            return;
+            return Vec::new();
         }
     };
 
     let keyframes = select_keyframes(&frames);
-    let mut written = 0;
+    let mut written_paths = Vec::new();
     for (i, frame) in keyframes.iter().enumerate() {
         let path = format!("{stem}_keyframe_{i}.jpg");
         match fs::write(&path, frame.jpeg) {
-            Ok(()) => written += 1,
+            Ok(()) => written_paths.push(PathBuf::from(path)),
             Err(e) => println!("video: failed to write {path}: {e}"),
         }
     }
     println!(
-        "video: extracted {written}/{} keyframe(s) from {} ({} total frame(s), timestamps {:?}ms)",
+        "video: extracted {}/{} keyframe(s) from {} ({} total frame(s), timestamps {:?}ms)",
+        written_paths.len(),
         keyframes.len(),
         video_path.display(),
         frames.len(),
         keyframes.iter().map(|f| f.timestamp_ms).collect::<Vec<_>>()
     );
+    written_paths
 }
 
 #[cfg(test)]
@@ -219,14 +225,16 @@ mod tests {
         let raw = encode_frames(&[(0, b"frame-zero"), (33, b"frame-one"), (66, b"frame-two")]);
         fs::write(&video_path, &raw).unwrap();
 
-        extract_keyframes(&video_path);
+        let written = extract_keyframes(&video_path);
 
         assert!(video_path.exists(), "original .bin must never be touched");
         assert_eq!(fs::read(&video_path).unwrap(), raw);
 
+        assert_eq!(written.len(), 3);
         for i in 0..3 {
             let keyframe = dir.join(format!("event_123_keyframe_{i}.jpg"));
             assert!(keyframe.exists(), "expected {keyframe:?} to exist");
+            assert_eq!(written[i], keyframe, "returned paths should match what was written, in order");
         }
         assert_eq!(fs::read(dir.join("event_123_keyframe_1.jpg")).unwrap(), b"frame-one");
 
@@ -239,7 +247,8 @@ mod tests {
         let video_path = dir.join("event_456_video.bin");
         fs::write(&video_path, b"not a valid frame stream at all, too short").unwrap();
 
-        extract_keyframes(&video_path);
+        let written = extract_keyframes(&video_path);
+        assert!(written.is_empty());
 
         let entries: Vec<_> = fs::read_dir(&dir).unwrap().collect();
         assert_eq!(entries.len(), 1, "only the untouched original file should remain");

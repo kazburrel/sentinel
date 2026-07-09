@@ -1808,8 +1808,74 @@ key frames turn out to be insufficient once real video-AI work starts.
   to consume once it starts, not to trigger it now. No full container/MJPEG-AVI
   conversion either, per the design choice above.
 
+## Milestone 22 — AI analysis now covers the whole event, not just the thumbnail
+
+Extends Milestone 19's AI analysis to also use Milestone 21's extracted video key
+frames: one combined `analysis.json` per event, describing the thumbnail and the
+clip together, not the thumbnail alone. Still no *raw video* analysis -- Ollama is
+never given the `.bin` file, only the already-extracted JPEG stills, and video AI
+otherwise remains exactly as deferred as before (no per-frame analysis of a whole
+clip, no bounding boxes, no face recognition, `identity.status` still always
+`"not_enabled"`).
+
+- **`server/src/ai.rs`**: the analyzer trait -- renamed `ThumbnailAnalyzer` ->
+  `EventAnalyzer` since it's no longer analyzing just one image -- changed from
+  `analyze(&self, jpeg_bytes: &[u8])` to `analyze(&self, images: &[&[u8]])`.
+  `OllamaAnalyzer` now base64-encodes every image into one `/api/generate` request's
+  `images` array (thumbnail first, then key frames in order) instead of exactly one.
+  `PROMPT` updated to the new event-level wording (explicitly: "treat all provided
+  images as one event over time", "the first image is the event thumbnail", "the
+  remaining images are keyframes from the recorded video", plus the same
+  privacy/security rules as before). `think: false` (the Milestone 19 fix for
+  `qwen3.5:4b`'s hybrid-reasoning mode) carries over unchanged.
+- **`analyze_and_save` signature grew a `keyframe_paths: &[PathBuf]` parameter.** The
+  thumbnail is still required (unreadable thumbnail = hard failure, same as before);
+  each key frame is read best-effort and simply skipped (logged, not fatal) if
+  unreadable -- an empty or fully-unreadable `keyframe_paths` transparently falls
+  back to exactly the thumbnail-only request Milestone 19 already made. There is no
+  separate "fallback mode" in the code -- just fewer images in the same request path.
+- **`server/src/video.rs`**: `extract_keyframes` now returns `Vec<PathBuf>` (the
+  paths actually written, possibly empty) instead of nothing, so its caller knows
+  exactly what's available to hand to analysis.
+- **`server/src/main.rs`**: the two previously-independent background threads (AI
+  analysis, key-frame extraction) are merged into one per event -- extraction runs
+  first (fast, and its result is exactly what "analyze the whole event" needs),
+  then analysis runs with whatever it produced. Still strictly after the upload's
+  `200` response is flushed, still on a single detached thread, still never able to
+  block the single-threaded accept loop from accepting the next connection.
+- **6 new/rewritten tests** in `ai.rs` (server now 48, up from 44): a
+  `RecordingAnalyzer` fake proves the exact images (and their order --
+  thumbnail first) actually reaching the analyzer, not just that *something* was
+  saved; missing/nonexistent key frame files fall back safely to thumbnail-only;
+  an empty key frame list behaves identically to thumbnail-only; a failing analyzer
+  still produces a valid failed-shape `analysis.json` even with key frames present
+  (never a panic); existing shape/identity/thumbnail-missing tests carried over
+  unchanged. `video.rs`'s existing extraction test now also asserts on the returned
+  `Vec<PathBuf>` matching what was actually written, in order.
+- **Verified end-to-end against a real running Ollama instance with a real
+  multi-image event** (not just synthetic tests): built a synthetic-but-real
+  `PsramRecorder`-format clip from 3 different real JPEGs (the same door-cam photo
+  used elsewhere, plus two unrelated real photos) and sent it as a thumbnail+video
+  event through the running release server. Confirmed: 3/3 key frames extracted,
+  response returned in ~25ms, and the resulting `analysis.json`'s description
+  mentioned *both* "headphones" (only in the thumbnail) *and* "sports jersey" (only
+  in the unrelated keyframe photos) in one combined sentence -- direct proof the
+  model was actually shown and used every image, not just the first one. A second,
+  thumbnail-only event sent immediately after produced a description mentioning only
+  the thumbnail's content, confirming the fallback path is unaffected and doesn't
+  leak unrelated content when no video is present.
+- `cargo test -p server` -- 48 tests, all passing. `cargo clippy -p server` clean.
+  Firmware entirely untouched (`git diff --stat -- firmware/` empty), confirmed.
+  Retention cleanup (Milestone 20) needed no changes at all -- keyframe files
+  already shared the `event_<timestamp>` prefix it groups by.
+
 ## Next steps (not yet started)
 
+- **AI analysis now covers the whole event: complete (Milestone 22).** Verified
+  against a real running Ollama instance with a real multi-image event, not just
+  synthetic tests -- the model's output demonstrably used both the thumbnail and
+  the video keyframes together. Video AI remains otherwise exactly as deferred as
+  before (no per-frame/raw-video analysis, no bounding boxes, no face recognition).
 - **Server-side key-frame extraction: complete (Milestone 21).** Verified against a
   real stored clip (not just synthetic tests). Sets up video-AI work for later
   (still explicitly deferred) without doing any of it yet.
@@ -1818,10 +1884,12 @@ key frames turn out to be insufficient once real video-AI work starts.
   smoke test that left all 137 recent real event files alone. Not yet observed
   deleting naturally aged-out real files over a real 30-day lifetime; low risk, not
   blocking anything.
-- **AI thumbnail analysis: complete (Milestone 19).** Verified end-to-end against a
-  real running Ollama instance, including the offline/failure path. Natural future
+- **AI thumbnail analysis: complete (Milestone 19).** Superseded by Milestone 22 for
+  the "thumbnail only" limitation specifically -- analysis now covers video key
+  frames too when present. The Ollama integration, prompt design, and
+  offline/failure handling proven here still apply unchanged. Natural future
   extensions, not started: the known-person-recognition module the `identity` block
-  was built to support, video analysis, bounding boxes -- none blocking anything else.
+  was built to support, bounding boxes -- none blocking anything else.
 - **Audio part, optional, later.** `PartKind::Audio` already exists in the envelope
   (reserved, unused) -- add it only once there's an actual audio source to capture;
   the wire format and server storage path need no changes to support it when that
@@ -1973,13 +2041,25 @@ tests passing; `cargo clippy -p server` clean; `firmware/` untouched. A real res
 of the running server confirmed the sweep starts cleanly and leaves recent real
 events alone.
 
-**Uncommitted, current** (Milestone 21, described above): new `server/src/video.rs`
+**Committed** (Milestone 21): new `server/src/video.rs`
 (`extract_keyframes`, frame parsing, `MAX_KEYFRAMES`-based even-spacing selection);
-`server/src/main.rs` spawns a third kind of detached background thread in
+`server/src/main.rs` spawned a third kind of detached background thread in
 `process_request` (alongside AI analysis) whenever a `Video` part was stored this
-request. `server` now has 44 tests passing; `cargo clippy -p server` clean;
+request. `server` had 44 tests passing; `cargo clippy -p server` clean;
 `firmware/` untouched. Verified against a real, previously-recorded 71-frame clip
 sent through the running release server, not just synthetic tests.
+
+**Uncommitted, current** (Milestone 22, described above): `server/src/ai.rs`'s
+`ThumbnailAnalyzer` trait renamed `EventAnalyzer` and its `analyze` method changed
+to take `images: &[&[u8]]` instead of one JPEG; `PROMPT` updated to the new
+event-level wording; `analyze_and_save` gained a `keyframe_paths` parameter.
+`server/src/video.rs`'s `extract_keyframes` now returns the written `Vec<PathBuf>`
+instead of nothing. `server/src/main.rs` merged the AI-analysis and key-frame-
+extraction background threads into one per event (extraction first, then analysis
+with whatever it produced). `server` now has 48 tests passing; `cargo clippy -p
+server` clean; `firmware/` untouched. Verified against a real running Ollama
+instance with a real multi-image event built from 3 different real JPEGs, and a
+real thumbnail-only fallback event sent immediately after.
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
 

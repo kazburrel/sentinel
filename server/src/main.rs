@@ -14,10 +14,12 @@
 //! recorded video later, audio optional after that), each written to its
 //! own file under `UPLOADS_DIR`.
 //!
-//! Milestone 19 added AI thumbnail analysis (`ai` module): after an event
-//! is stored *and* the firmware upload has already been answered, the
-//! thumbnail is sent to a local Ollama vision model and the result saved
-//! as `analysis.json` beside the event's files. This is deliberately
+//! Milestone 19 added AI event analysis (`ai` module): after an event is
+//! stored *and* the firmware upload has already been answered, its
+//! thumbnail -- plus, since Milestone 22, any video key frames Milestone
+//! 21's `video` module extracted -- is sent to a local Ollama vision
+//! model as one multi-image request, and the result saved as
+//! `analysis.json` beside the event's files. This is deliberately
 //! decoupled from the upload response -- Ollama being offline, slow, or
 //! wrong can never affect whether an event upload succeeds.
 //!
@@ -470,7 +472,7 @@ fn store_event(dir: &str, body: &[u8], dedup: &mut EventDedup) -> Result<Vec<Str
 fn process_request(
     stream: &mut TcpStream,
     dedup: &mut EventDedup,
-    analyzer: &Arc<dyn ai::ThumbnailAnalyzer>,
+    analyzer: &Arc<dyn ai::EventAnalyzer>,
 ) -> Result<(), RequestError> {
     let peer = stream.peer_addr()?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -513,35 +515,39 @@ fn process_request(
     stream.write_all(response)?;
     stream.flush()?;
 
-    // Strictly after the response above, and on its own detached thread --
+    // Strictly after the response above, and on one detached thread --
     // firmware's upload has already succeeded or failed on its own merits
     // by this point, and this server's accept loop is single-threaded, so
     // an in-line call here would block every subsequent upload from even
     // being accepted until Ollama finished. A duplicate event (empty
     // `filenames`, nothing new stored) has nothing new to analyze either.
+    //
+    // Key-frame extraction runs first, in the same thread, because its
+    // result (however many key frames it produces, possibly zero) is
+    // exactly what "analyze the whole event" means now: the thumbnail plus
+    // whatever video stills are available. There's nothing to gain from a
+    // separate thread per step here -- extraction is fast, and analysis
+    // needs extraction's result before it can even start.
     if let Some(thumbnail_path) = filenames.iter().find(|f| f.ends_with("_thumbnail.jpg")) {
         let analysis_path = format!("{}_analysis.json", thumbnail_path.trim_end_matches("_thumbnail.jpg"));
         let thumbnail_path = thumbnail_path.clone();
+        let video_path = filenames.iter().find(|f| f.ends_with("_video.bin")).cloned();
         let analyzer = Arc::clone(analyzer);
         std::thread::spawn(move || {
-            ai::analyze_and_save(analyzer.as_ref(), Path::new(&thumbnail_path), Path::new(&analysis_path));
-        });
-    }
-
-    // Same reasoning, same detached-thread treatment: key-frame extraction
-    // reads the just-stored video part but never touches or gates the
-    // upload response, and only ever adds new files alongside it.
-    if let Some(video_path) = filenames.iter().find(|f| f.ends_with("_video.bin")) {
-        let video_path = video_path.clone();
-        std::thread::spawn(move || {
-            video::extract_keyframes(Path::new(&video_path));
+            let keyframe_paths = video_path.map(|v| video::extract_keyframes(Path::new(&v))).unwrap_or_default();
+            ai::analyze_and_save(
+                analyzer.as_ref(),
+                Path::new(&thumbnail_path),
+                &keyframe_paths,
+                Path::new(&analysis_path),
+            );
         });
     }
 
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, dedup: &mut EventDedup, analyzer: &Arc<dyn ai::ThumbnailAnalyzer>) {
+fn handle_connection(mut stream: TcpStream, dedup: &mut EventDedup, analyzer: &Arc<dyn ai::EventAnalyzer>) {
     if let Err(e) = process_request(&mut stream, dedup, analyzer) {
         println!("request failed: {e:?}");
         let _ = stream.write_all(e.status_line().as_bytes());
@@ -1057,7 +1063,7 @@ fn main() -> std::io::Result<()> {
     // doc comment. Startup must not depend on Ollama being up. `Arc` so each
     // event's background analysis thread (see `process_request`) can share
     // it without cloning the underlying config/HTTP setup per event.
-    let analyzer: Arc<dyn ai::ThumbnailAnalyzer> = Arc::new(ai::OllamaAnalyzer::from_env(AI_ANALYSIS_TIMEOUT));
+    let analyzer: Arc<dyn ai::EventAnalyzer> = Arc::new(ai::OllamaAnalyzer::from_env(AI_ANALYSIS_TIMEOUT));
 
     // Runs independently of the accept loop below, for the same reason the
     // AI analysis call is never in-line: this server is single-threaded

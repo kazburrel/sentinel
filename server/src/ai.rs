@@ -1,12 +1,20 @@
-//! Server-side AI analysis of an event's thumbnail, via a local Ollama
-//! vision model (default `qwen3.5:4b`) -- one thumbnail per event, no video
-//! analysis yet. Runs strictly *after* the event is already fully stored
-//! and the firmware upload has already been answered with `200`, on a
-//! detached background thread (see the call site in `main.rs`) -- this
-//! server's accept loop is single-threaded and synchronous, so an in-line
-//! call here would block every other upload from being accepted until
-//! Ollama finished, not just the current one. `analyze_and_save` itself
-//! never returns an error; every failure just downgrades `ai.status` to
+//! Server-side AI analysis of a whole camera event, via a local Ollama
+//! vision model (default `qwen3.5:4b`): the thumbnail plus any extracted
+//! video key frames (`video::extract_keyframes`) are sent together as one
+//! multi-image request, so the model describes the event as a whole
+//! rather than just its first still. Still no *raw video* analysis --
+//! Ollama is never given the `.bin` file itself, only the JPEG stills
+//! already extracted from it (see `video.rs`); if extraction produced
+//! nothing (no video part, extraction failed, or the clip was empty),
+//! this falls back to thumbnail-only analysis exactly like before.
+//!
+//! Runs strictly *after* the event is already fully stored and the
+//! firmware upload has already been answered with `200`, on a detached
+//! background thread (see the call site in `main.rs`) -- this server's
+//! accept loop is single-threaded and synchronous, so an in-line call
+//! here would block every other upload from being accepted until Ollama
+//! finished, not just the current one. `analyze_and_save` itself never
+//! returns an error; every failure just downgrades `ai.status` to
 //! `"failed"` and moves on.
 //!
 //! The saved `analysis.json` also carries an `identity` block that is
@@ -18,18 +26,20 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-/// Fixed prompt sent to the vision model for every event thumbnail --
-/// deliberately security-focused and explicit about *not* identifying
-/// anyone or describing sensitive appearance traits, since this is a
-/// door-camera event a person may not know is being analyzed.
-const PROMPT: &str = r#"Analyze this image as a smart door-camera event thumbnail.
+/// Fixed prompt sent to the vision model for every event -- the first
+/// image is always the thumbnail, any remaining images are video key
+/// frames in chronological order. Deliberately security-focused and
+/// explicit about *not* identifying anyone or describing sensitive
+/// appearance traits, since this is a door-camera event a person may not
+/// know is being analyzed.
+const PROMPT: &str = r#"Analyze this smart door-camera event using the thumbnail and video keyframes provided.
 
 Return JSON only with exactly these fields:
 {
@@ -42,19 +52,24 @@ Return JSON only with exactly these fields:
 }
 
 Rules:
+- Treat all provided images as one event over time.
+- The first image is the event thumbnail.
+- The remaining images are keyframes from the recorded video.
 - Do not identify anyone.
 - Do not describe race, ethnicity, gender, age, attractiveness, or other sensitive appearance traits.
 - Do not call the image a selfie.
 - Keep the description neutral, short, and security-focused.
-- If a person is visible, describe only their presence, position, or activity near the camera.
-- Set importance to high if a person or package is near the door/camera.
-- Set importance to medium if a person is visible but there is no clear door/package/security concern.
-- Set importance to low if no person, package, vehicle, or animal is visible."#;
+- If a person appears in any frame, set person to true.
+- If a package appears in any frame, set package to true.
+- If a vehicle appears in any frame, set vehicle to true.
+- If an animal appears in any frame, set animal to true.
+- Set importance to high if a person or package appears near the door/camera.
+- Set importance to medium if a person/vehicle/animal appears but there is no clear concern.
+- Set importance to low if none of the tracked objects appear."#;
 
-/// One event thumbnail's AI-derived analysis -- exactly the fields the
-/// vision model is asked to return. Parsed strictly: a response that
-/// doesn't match this shape is treated as a failure, not silently patched
-/// or defaulted.
+/// One event's AI-derived analysis -- exactly the fields the vision model
+/// is asked to return. Parsed strictly: a response that doesn't match this
+/// shape is treated as a failure, not silently patched or defaulted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventAnalysis {
     pub person: bool,
@@ -133,28 +148,31 @@ pub enum AnalyzeError {
     InvalidResponse(String),
 }
 
-/// Anything that can turn a JPEG thumbnail into an `EventAnalysis`.
-/// `OllamaAnalyzer` is the real implementation; tests use a fake one so
-/// they never require Ollama to actually be running. `provider`/`model`
-/// feed directly into the saved `ai` block, so each implementation is the
-/// single source of truth for what it actually is/uses.
+/// Anything that can turn a set of JPEG images (thumbnail first, then any
+/// video key frames in order) into one `EventAnalysis` for the whole
+/// event. `OllamaAnalyzer` is the real implementation; tests use a fake
+/// one so they never require Ollama to actually be running.
+/// `provider`/`model` feed directly into the saved `ai` block, so each
+/// implementation is the single source of truth for what it actually
+/// is/uses.
 ///
 /// `Send + Sync` because `main.rs` runs `analyze_and_save` on a detached
 /// background thread per event (see its doc comment) -- this server's
 /// accept loop is single-threaded/synchronous, so a slow analysis call must
 /// never run inline with request handling, or it would block every other
 /// upload from even being accepted until it finished.
-pub trait ThumbnailAnalyzer: Send + Sync {
-    fn analyze(&self, jpeg_bytes: &[u8]) -> Result<EventAnalysis, AnalyzeError>;
+pub trait EventAnalyzer: Send + Sync {
+    fn analyze(&self, images: &[&[u8]]) -> Result<EventAnalysis, AnalyzeError>;
     fn provider(&self) -> &str;
     fn model(&self) -> &str;
 }
 
-/// Calls a local Ollama server's `/api/generate` endpoint with the
-/// thumbnail as a base64 image and the fixed prompt above. Constructing
-/// this never talks to Ollama -- the server must be able to start (and
-/// keep serving uploads) with Ollama offline; only an actual `analyze`
-/// call touches the network, and that call is always bounded by `timeout`.
+/// Calls a local Ollama server's `/api/generate` endpoint with every image
+/// (thumbnail first, then key frames) base64-encoded into one request and
+/// the fixed prompt above. Constructing this never talks to Ollama -- the
+/// server must be able to start (and keep serving uploads) with Ollama
+/// offline; only an actual `analyze` call touches the network, and that
+/// call is always bounded by `timeout`.
 pub struct OllamaAnalyzer {
     base_url: String,
     model: String,
@@ -183,7 +201,7 @@ impl OllamaAnalyzer {
 struct OllamaGenerateRequest<'a> {
     model: &'a str,
     prompt: &'a str,
-    images: [&'a str; 1],
+    images: Vec<String>,
     stream: bool,
     format: &'a str,
     /// Explicitly disabled: hybrid reasoning models (e.g. `qwen3.5:4b`, which
@@ -200,7 +218,7 @@ struct OllamaGenerateResponse {
     response: String,
 }
 
-impl ThumbnailAnalyzer for OllamaAnalyzer {
+impl EventAnalyzer for OllamaAnalyzer {
     fn provider(&self) -> &str {
         "ollama"
     }
@@ -209,12 +227,12 @@ impl ThumbnailAnalyzer for OllamaAnalyzer {
         &self.model
     }
 
-    fn analyze(&self, jpeg_bytes: &[u8]) -> Result<EventAnalysis, AnalyzeError> {
-        let image_b64 = STANDARD.encode(jpeg_bytes);
+    fn analyze(&self, images: &[&[u8]]) -> Result<EventAnalysis, AnalyzeError> {
+        let images_b64: Vec<String> = images.iter().map(|img| STANDARD.encode(img)).collect();
         let request = OllamaGenerateRequest {
             model: &self.model,
             prompt: PROMPT,
-            images: [&image_b64],
+            images: images_b64,
             stream: false,
             format: "json",
             think: false,
@@ -254,37 +272,64 @@ fn parse_event_analysis(raw: &str) -> Result<EventAnalysis, AnalyzeError> {
     serde_json::from_str(json_text).map_err(|e| AnalyzeError::InvalidResponse(format!("{e}: {json_text:?}")))
 }
 
-/// Reads the stored thumbnail, runs it through `analyzer`, and writes
-/// `analysis.json` beside it. Never returns an error or panics -- see the
+/// Reads the thumbnail plus any given key frames (in order), runs them
+/// through `analyzer` as one multi-image event, and writes `analysis.json`
+/// beside the thumbnail. Never returns an error or panics -- see the
 /// module doc for why AI analysis must never be able to affect whether an
-/// event upload succeeds. Any failure (missing thumbnail, Ollama offline,
-/// timeout, an unparseable response) is logged and just results in
-/// `ai.status = "failed"` in the saved file instead.
-pub fn analyze_and_save(analyzer: &dyn ThumbnailAnalyzer, thumbnail_path: &Path, analysis_path: &Path) {
+/// event upload succeeds.
+///
+/// The thumbnail is required -- if it can't be read, analysis fails
+/// entirely, same as before this milestone. Key frames are best-effort
+/// supplements: any individual key frame that can't be read is skipped
+/// (logged, not fatal), and if `keyframe_paths` is empty or every one of
+/// them fails to read, this transparently falls back to exactly the
+/// thumbnail-only analysis Milestone 19 already did -- there is no
+/// separate "fallback mode", just fewer images in the same request.
+pub fn analyze_and_save(
+    analyzer: &dyn EventAnalyzer,
+    thumbnail_path: &Path,
+    keyframe_paths: &[PathBuf],
+    analysis_path: &Path,
+) {
     let meta = |status| AiMeta {
         provider: analyzer.provider().to_string(),
         model: analyzer.model().to_string(),
         status,
     };
 
-    let result = match fs::read(thumbnail_path) {
-        Ok(jpeg_bytes) => match analyzer.analyze(&jpeg_bytes) {
-            Ok(event_analysis) => AnalysisResult {
-                event_analysis: Some(event_analysis),
-                identity: Identity::not_enabled(),
-                ai: meta(AiStatus::Success),
-            },
-            Err(e) => {
-                println!("AI analysis failed for {}: {e:?}", thumbnail_path.display());
-                AnalysisResult {
-                    event_analysis: None,
-                    identity: Identity::not_enabled(),
-                    ai: meta(AiStatus::Failed),
-                }
-            }
-        },
+    let thumbnail_bytes = match fs::read(thumbnail_path) {
+        Ok(bytes) => bytes,
         Err(e) => {
             println!("AI analysis: failed to read thumbnail {}: {e}", thumbnail_path.display());
+            let result = AnalysisResult {
+                event_analysis: None,
+                identity: Identity::not_enabled(),
+                ai: meta(AiStatus::Failed),
+            };
+            if let Err(e) = save_analysis_json(analysis_path, &result) {
+                println!("AI analysis: failed to save {}: {e}", analysis_path.display());
+            }
+            return;
+        }
+    };
+
+    let mut images = vec![thumbnail_bytes];
+    for keyframe_path in keyframe_paths {
+        match fs::read(keyframe_path) {
+            Ok(bytes) => images.push(bytes),
+            Err(e) => println!("AI analysis: failed to read keyframe {}: {e} (skipping it)", keyframe_path.display()),
+        }
+    }
+
+    let image_refs: Vec<&[u8]> = images.iter().map(|b| b.as_slice()).collect();
+    let result = match analyzer.analyze(&image_refs) {
+        Ok(event_analysis) => AnalysisResult {
+            event_analysis: Some(event_analysis),
+            identity: Identity::not_enabled(),
+            ai: meta(AiStatus::Success),
+        },
+        Err(e) => {
+            println!("AI analysis failed for {} ({} image(s)): {e:?}", thumbnail_path.display(), image_refs.len());
             AnalysisResult {
                 event_analysis: None,
                 identity: Identity::not_enabled(),
@@ -311,13 +356,14 @@ fn save_analysis_json(path: &Path, result: &AnalysisResult) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeAnalyzer {
         result: Result<EventAnalysis, ()>,
     }
 
-    impl ThumbnailAnalyzer for FakeAnalyzer {
+    impl EventAnalyzer for FakeAnalyzer {
         fn provider(&self) -> &str {
             "ollama"
         }
@@ -326,7 +372,46 @@ mod tests {
             "qwen3.5:4b"
         }
 
-        fn analyze(&self, _jpeg_bytes: &[u8]) -> Result<EventAnalysis, AnalyzeError> {
+        fn analyze(&self, _images: &[&[u8]]) -> Result<EventAnalysis, AnalyzeError> {
+            self.result
+                .clone()
+                .map_err(|()| AnalyzeError::Request("fake failure".to_string()))
+        }
+    }
+
+    /// Records exactly which images (as byte vectors, so tests can assert
+    /// on both count and content) it was called with, so tests can prove
+    /// what `analyze_and_save` actually sent to the analyzer -- not just
+    /// that *something* was saved.
+    struct RecordingAnalyzer {
+        received: Mutex<Vec<Vec<Vec<u8>>>>,
+        result: Result<EventAnalysis, ()>,
+    }
+
+    impl RecordingAnalyzer {
+        fn new(result: Result<EventAnalysis, ()>) -> Self {
+            Self {
+                received: Mutex::new(Vec::new()),
+                result,
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<Vec<u8>>> {
+            self.received.lock().unwrap().clone()
+        }
+    }
+
+    impl EventAnalyzer for RecordingAnalyzer {
+        fn provider(&self) -> &str {
+            "ollama"
+        }
+
+        fn model(&self) -> &str {
+            "qwen3.5:4b"
+        }
+
+        fn analyze(&self, images: &[&[u8]]) -> Result<EventAnalysis, AnalyzeError> {
+            self.received.lock().unwrap().push(images.iter().map(|b| b.to_vec()).collect());
             self.result
                 .clone()
                 .map_err(|()| AnalyzeError::Request("fake failure".to_string()))
@@ -344,10 +429,15 @@ mod tests {
         }
     }
 
-    fn scratch_paths(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn scratch_dir(label: &str) -> PathBuf {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
         let dir = std::env::temp_dir().join(format!("camera_server_test_ai_{label}_{unique}"));
         fs::create_dir_all(&dir).expect("scratch dir should be creatable");
+        dir
+    }
+
+    fn scratch_paths(label: &str) -> (PathBuf, PathBuf) {
+        let dir = scratch_dir(label);
         (dir.join("thumbnail.jpg"), dir.join("analysis.json"))
     }
 
@@ -359,7 +449,7 @@ mod tests {
         let analyzer = FakeAnalyzer {
             result: Ok(sample_analysis()),
         };
-        analyze_and_save(&analyzer, &thumb_path, &analysis_path);
+        analyze_and_save(&analyzer, &thumb_path, &[], &analysis_path);
 
         let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&analysis_path).unwrap()).unwrap();
         assert_eq!(saved["event_analysis"]["person"], true);
@@ -379,7 +469,7 @@ mod tests {
         fs::write(&thumb_path, b"fake-jpeg-bytes").unwrap();
 
         let analyzer = FakeAnalyzer { result: Err(()) };
-        analyze_and_save(&analyzer, &thumb_path, &analysis_path);
+        analyze_and_save(&analyzer, &thumb_path, &[], &analysis_path);
 
         let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&analysis_path).unwrap()).unwrap();
         assert!(saved["event_analysis"].is_null());
@@ -398,13 +488,114 @@ mod tests {
         let analyzer = FakeAnalyzer {
             result: Ok(sample_analysis()),
         };
-        analyze_and_save(&analyzer, &thumb_path, &analysis_path);
+        analyze_and_save(&analyzer, &thumb_path, &[], &analysis_path);
 
         let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&analysis_path).unwrap()).unwrap();
         assert!(saved["event_analysis"].is_null());
         assert_eq!(saved["ai"]["status"], "failed");
 
         fs::remove_dir_all(analysis_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn thumbnail_and_keyframes_are_all_passed_to_the_analyzer_in_order() {
+        let dir = scratch_dir("multi_image");
+        let thumb_path = dir.join("event_1_thumbnail.jpg");
+        let analysis_path = dir.join("event_1_analysis.json");
+        fs::write(&thumb_path, b"thumbnail-bytes").unwrap();
+
+        let keyframe_paths: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let path = dir.join(format!("event_1_keyframe_{i}.jpg"));
+                fs::write(&path, format!("keyframe-{i}-bytes")).unwrap();
+                path
+            })
+            .collect();
+
+        let analyzer = RecordingAnalyzer::new(Ok(sample_analysis()));
+        analyze_and_save(&analyzer, &thumb_path, &keyframe_paths, &analysis_path);
+
+        let calls = analyzer.calls();
+        assert_eq!(calls.len(), 1, "analyze should be called exactly once");
+        let images = &calls[0];
+        assert_eq!(images.len(), 4, "thumbnail + 3 keyframes");
+        assert_eq!(images[0], b"thumbnail-bytes", "thumbnail must be first");
+        assert_eq!(images[1], b"keyframe-0-bytes");
+        assert_eq!(images[2], b"keyframe-1-bytes");
+        assert_eq!(images[3], b"keyframe-2-bytes");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_keyframes_falls_back_to_thumbnail_only_safely() {
+        let dir = scratch_dir("missing_keyframes");
+        let thumb_path = dir.join("event_2_thumbnail.jpg");
+        let analysis_path = dir.join("event_2_analysis.json");
+        fs::write(&thumb_path, b"thumbnail-bytes").unwrap();
+
+        // Neither keyframe file actually exists on disk -- simulates
+        // extraction failing or producing nothing.
+        let keyframe_paths = vec![
+            dir.join("event_2_keyframe_0.jpg"),
+            dir.join("event_2_keyframe_1.jpg"),
+        ];
+
+        let analyzer = RecordingAnalyzer::new(Ok(sample_analysis()));
+        analyze_and_save(&analyzer, &thumb_path, &keyframe_paths, &analysis_path);
+
+        let calls = analyzer.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 1, "only the thumbnail should have been sent");
+        assert_eq!(calls[0][0], b"thumbnail-bytes");
+
+        // Still produces a normal, successful analysis.json -- a missing
+        // keyframe is not a failure, just fewer images in the request.
+        let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&analysis_path).unwrap()).unwrap();
+        assert_eq!(saved["ai"]["status"], "success");
+        assert_eq!(saved["identity"]["status"], "not_enabled");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_keyframe_list_behaves_exactly_like_thumbnail_only() {
+        let (thumb_path, analysis_path) = scratch_paths("empty_keyframes");
+        fs::write(&thumb_path, b"thumbnail-bytes").unwrap();
+
+        let analyzer = RecordingAnalyzer::new(Ok(sample_analysis()));
+        analyze_and_save(&analyzer, &thumb_path, &[], &analysis_path);
+
+        let calls = analyzer.calls();
+        assert_eq!(calls[0].len(), 1);
+        assert_eq!(calls[0][0], b"thumbnail-bytes");
+
+        fs::remove_dir_all(thumb_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn upload_semantics_still_succeed_when_ai_fails_with_keyframes_present() {
+        // Named to make the acceptance criterion explicit: even with
+        // keyframes in play, a failing analyzer must still result in a
+        // saved (failed-shape) analysis.json, never a panic -- the caller
+        // (main.rs's process_request) has already answered the firmware
+        // upload with 200 by the time this ever runs.
+        let dir = scratch_dir("fails_with_keyframes");
+        let thumb_path = dir.join("event_3_thumbnail.jpg");
+        let analysis_path = dir.join("event_3_analysis.json");
+        let keyframe_path = dir.join("event_3_keyframe_0.jpg");
+        fs::write(&thumb_path, b"thumbnail-bytes").unwrap();
+        fs::write(&keyframe_path, b"keyframe-bytes").unwrap();
+
+        let analyzer = FakeAnalyzer { result: Err(()) };
+        analyze_and_save(&analyzer, &thumb_path, &[keyframe_path], &analysis_path);
+
+        let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&analysis_path).unwrap()).unwrap();
+        assert!(saved["event_analysis"].is_null());
+        assert_eq!(saved["ai"]["status"], "failed");
+        assert_eq!(saved["identity"]["status"], "not_enabled");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
