@@ -1589,20 +1589,104 @@ PSRAM buffers get reused by the next motion event.
   upload artifacts deleted afterward, per this project's established
   practice. **Milestone 18 is complete.**
 
+## Milestone 19 — server-side AI thumbnail analysis via local Ollama, with a future-ready identity slot
+
+Built on Codex's research (`qwen3.5:4b` via Ollama: Apache-2.0 weights, multimodal,
+~3.4GB local build, free to run, keeps images on the user's own network -- see
+https://huggingface.co/Qwen/Qwen3.5-4B / https://ollama.com/library/qwen3.5). Scoped
+entirely to the `server` crate per explicit instruction -- no firmware changes; the
+JPEG thumbnail firmware already sends in every event envelope needed nothing new.
+
+- **New `server/src/ai.rs`**: `EventAnalysis` (`person`/`package`/`vehicle`/`animal`
+  bools, `description: String`, `importance: Importance` (`Low`/`Medium`/`High`,
+  serialized lowercase)) is parsed strictly from the model's JSON output -- an
+  unexpected shape is a failure, never silently patched. `ThumbnailAnalyzer` trait
+  (`analyze`/`provider`/`model`) is the swappable boundary: `OllamaAnalyzer` for real
+  use, a `FakeAnalyzer` in tests so none of them require Ollama running.
+  `OllamaAnalyzer::from_env` reads `OLLAMA_URL`/`OLLAMA_MODEL`, defaulting to
+  `http://localhost:11434`/`qwen3.5:4b` -- constructing it never talks to Ollama, so
+  server startup never depends on Ollama being up.
+- **`identity` block, deliberately inert**: always `{"status": "not_enabled",
+  "known_person_id": null, "display_name": null, "confidence": null}`. No face
+  recognition, no embeddings, no people database, and the vision model is never asked
+  to identify anyone -- the block exists purely so a future local
+  known-person-recognition module can be plugged in without another pipeline change.
+- **Saved `analysis.json`** (`{event_analysis, identity, ai}`, `event_analysis: null`
+  on any failure) is written beside the event's other files via the same
+  temp-file-then-rename pattern `commit_part_file` uses, keyed off the thumbnail's own
+  filename (`event_<timestamp>_thumbnail.jpg` -> `event_<timestamp>_analysis.json`) --
+  no changes needed to `store_event`/`commit_part_file`/`part_file_naming` at all.
+- **Analysis runs strictly after the firmware upload's `200` response is already
+  flushed, on a detached background thread -- a real bug found and fixed during
+  testing, not just a design choice.** This server's accept loop is single-threaded
+  and fully synchronous (`for stream in listener.incoming() { handle_connection(...) }`,
+  no thread-per-connection). An early version called `analyze_and_save` in-line inside
+  `process_request` after the response was written; a real end-to-end test (see below)
+  showed the TCP connection was still held open for the full Ollama call, and -- more
+  seriously -- the entire server couldn't accept a *second* connection until the first
+  event's analysis finished. Fixed by wrapping the analyzer in `Arc<dyn
+  ThumbnailAnalyzer>` (trait now requires `Send + Sync`) and spawning a detached
+  `std::thread::spawn` per event for the analysis call; `process_request` returns
+  immediately once the response is flushed. Verified with a real Ollama call: an
+  upload now completes in ~50ms regardless of Ollama, and a second event can be
+  uploaded and accepted immediately while the first's analysis is still running.
+- **Real bug found and fixed against the actual running Ollama instance**:
+  `qwen3.5:4b` is a hybrid-reasoning ("thinking") model. With `format: "json"` and no
+  other setting, its entire answer -- confirmed by direct inspection -- lands in
+  Ollama's separate `thinking` response field, leaving the `response` field (the one
+  this code parses) empty, which then fails strict JSON parsing every time. Root
+  cause confirmed directly (raw `/api/generate` calls against the real local Ollama
+  instance) before fixing, not guessed. Fixed by adding `"think": false` to the
+  request body -- verified this both populates `response` correctly *and* is faster
+  (~4-12s vs ~10-19s, since the model skips its chain-of-thought pass).
+- **6 new tests** in `ai.rs` using `FakeAnalyzer` (server now 27, up from 21): saves
+  the success shape correctly (including `identity.status`); saves the failure shape
+  without panicking when the analyzer itself errors; saves the failure shape when the
+  thumbnail file is missing; a markdown-code-fenced model response still parses (a
+  known, harmless VLM quirk -- tolerated defensively); a response missing required
+  fields is rejected; `Identity::not_enabled()` is asserted directly.
+- **Verified end-to-end against the real running Ollama instance** (not just fakes):
+  built a raw envelope-format POST client to exercise the real server binary
+  (`cargo test` alone can't reach a real Ollama process). Confirmed, in order: (1) a
+  real event with a real JPEG thumbnail produces a correctly-shaped `analysis.json`
+  with genuine model output and `ai.status = "success"`; (2) pointing `OLLAMA_URL` at
+  an unreachable port still returns `200` to the client in ~50ms, with
+  `analysis.json` saved as `ai.status = "failed"`, `event_analysis: null`,
+  `identity.status` still `"not_enabled"` -- Ollama being offline never touches
+  upload success; (3) the real prompt's privacy rules hold against the real model
+  (tested directly against `/api/generate`): no identification, no race/age/etc.
+  description, never called a "selfie", output stayed neutral and security-focused;
+  (4) a real motion event from the actual board (still running from Milestone 18's
+  hardware test) was independently observed going through the same pipeline
+  correctly while this was being tested. Test artifacts (the synthetic events, not
+  the real board's) cleaned up afterward, per this project's established practice;
+  a handful of harmless test `event_id`s remain in the bounded/FIFO
+  `event_dedup.log` (never collide with real event IDs, age out naturally).
+- `cargo test -p server` -- 27 tests, all passing. `cargo clippy -p server` clean.
+  Firmware entirely untouched (`git diff --stat -- firmware/` empty) -- confirmed
+  before and after, per the explicit scope instruction.
+- **New dependencies** (`server/Cargo.toml` only): `ureq` (with the `json` feature,
+  for the Ollama HTTP call), `serde`/`serde_json` (for both the strict Ollama-response
+  parsing and the saved `analysis.json`), `base64` (thumbnail encoding).
+- **Deliberately not done yet**, per explicit scope: face recognition, bounding
+  boxes, video analysis (still thumbnail-only), and no model-downloading code
+  anywhere (Ollama/model installation stays a deployment concern, not application
+  code).
+
 ## Next steps (not yet started)
 
+- **AI thumbnail analysis: complete (Milestone 19).** Verified end-to-end against a
+  real running Ollama instance, including the offline/failure path. Natural future
+  extensions, not started: the known-person-recognition module the `identity` block
+  was built to support, video analysis, bounding boxes -- none blocking anything else.
 - **Audio part, optional, later.** `PartKind::Audio` already exists in the envelope
   (reserved, unused) -- add it only once there's an actual audio source to capture;
   the wire format and server storage path need no changes to support it when that
   happens.
-- **Persistent offline queue: implemented (Milestone 18), needs its real hardware pass.**
-  `firmware::queue` now saves an event to the SD card when `upload_event_with_retries`
-  exhausts its attempts, and drains (uploads + deletes-on-`200`) the queue at boot and
-  after every successful live upload; `EventDedup` on the server now persists across
-  restarts too. What's left is the actual hardware verification (kill the server mid-event,
-  confirm the save, bring it back, confirm drain-and-delete, confirm no duplicate store
-  across a server restart) -- see Milestone 18's own "not yet verified on real hardware"
-  note above.
+- **Persistent offline queue: complete (Milestone 18).** Its real server-outage → SD
+  save → recovery → drain-and-delete path is hardware-verified above. Optional extra
+  hardening remains: test a missing/failed card and an actual duplicate replay after a
+  server restart, but neither blocks moving to local AI analysis.
 - Build out the `server` crate's request routing beyond the single `POST /upload`
   endpoint (structured per-part storage is now done, per Milestone 14) once there's an
   actual second concern to route to (e.g. an AI-processing trigger or a query endpoint).
@@ -1727,6 +1811,14 @@ optional subsystem and wires save-on-failure/drain-on-success into the event loo
 `server/src/main.rs`'s `EventDedup` gained `new_with_persistence` so dedup survives a
 server restart; `server/event_dedup.log` added to `.gitignore`. Verified at the
 build/test level only -- not yet a real hardware pass (see Milestone 18 above).
+
+**Uncommitted, current** (Milestone 19, described above): new `server/src/ai.rs`
+(`ThumbnailAnalyzer` trait, `OllamaAnalyzer`, `EventAnalysis`/`Identity`/`AiMeta`/
+`AnalysisResult`, `analyze_and_save`); `server/src/main.rs` adds `mod ai;`, threads an
+`Arc<dyn ThumbnailAnalyzer>` through `process_request`/`handle_connection`/`main`, and
+spawns a detached background thread per event for the analysis call (never in-line,
+per the single-threaded-accept-loop finding above); `server/Cargo.toml` gained `ureq`
+(`json` feature), `serde`/`serde_json`, `base64`. `firmware/` untouched.
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
 

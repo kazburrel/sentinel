@@ -14,15 +14,25 @@
 //! recorded video later, audio optional after that), each written to its
 //! own file under `UPLOADS_DIR`.
 //!
+//! Milestone 19 added AI thumbnail analysis (`ai` module): after an event
+//! is stored *and* the firmware upload has already been answered, the
+//! thumbnail is sent to a local Ollama vision model and the result saved
+//! as `analysis.json` beside the event's files. This is deliberately
+//! decoupled from the upload response -- Ollama being offline, slow, or
+//! wrong can never affect whether an event upload succeeds.
+//!
 //! Only acceptable on a trusted LAN during development -- see
 //! `PROJECT_STATUS.md`'s security threat model for what's still needed
 //! before this is exposed beyond that (TLS, network segmentation).
 
+mod ai;
 mod config;
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use shared::{decode_envelope_header, EnvelopeError, PartHeader, PartKind, PartsIter};
@@ -39,6 +49,10 @@ const MAX_BODY_BYTES: usize = 12 * 1024 * 1024;
 // `cargo run -p server` from the workspace root vs. `cargo run` from inside
 // `server/` land uploads in different places otherwise).
 const UPLOADS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/uploads");
+/// Bounds one Ollama analysis call -- a slow/hung local model must not be
+/// able to block the analysis pass forever (it already can't block the
+/// firmware upload response at all; see the `ai` module doc).
+const AI_ANALYSIS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 enum RequestError {
@@ -451,7 +465,11 @@ fn store_event(dir: &str, body: &[u8], dedup: &mut EventDedup) -> Result<Vec<Str
 
 /// Does the actual request handling; the caller is responsible for turning
 /// an `Err` into the right HTTP error response on the same stream.
-fn process_request(stream: &mut TcpStream, dedup: &mut EventDedup) -> Result<(), RequestError> {
+fn process_request(
+    stream: &mut TcpStream,
+    dedup: &mut EventDedup,
+    analyzer: &Arc<dyn ai::ThumbnailAnalyzer>,
+) -> Result<(), RequestError> {
     let peer = stream.peer_addr()?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     println!("connection from {peer}");
@@ -492,11 +510,27 @@ fn process_request(stream: &mut TcpStream, dedup: &mut EventDedup) -> Result<(),
     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     stream.write_all(response)?;
     stream.flush()?;
+
+    // Strictly after the response above, and on its own detached thread --
+    // firmware's upload has already succeeded or failed on its own merits
+    // by this point, and this server's accept loop is single-threaded, so
+    // an in-line call here would block every subsequent upload from even
+    // being accepted until Ollama finished. A duplicate event (empty
+    // `filenames`, nothing new stored) has nothing new to analyze either.
+    if let Some(thumbnail_path) = filenames.iter().find(|f| f.ends_with("_thumbnail.jpg")) {
+        let analysis_path = format!("{}_analysis.json", thumbnail_path.trim_end_matches("_thumbnail.jpg"));
+        let thumbnail_path = thumbnail_path.clone();
+        let analyzer = Arc::clone(analyzer);
+        std::thread::spawn(move || {
+            ai::analyze_and_save(analyzer.as_ref(), Path::new(&thumbnail_path), Path::new(&analysis_path));
+        });
+    }
+
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, dedup: &mut EventDedup) {
-    if let Err(e) = process_request(&mut stream, dedup) {
+fn handle_connection(mut stream: TcpStream, dedup: &mut EventDedup, analyzer: &Arc<dyn ai::ThumbnailAnalyzer>) {
+    if let Err(e) = process_request(&mut stream, dedup, analyzer) {
         println!("request failed: {e:?}");
         let _ = stream.write_all(e.status_line().as_bytes());
         let _ = stream.write_all(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -1002,9 +1036,14 @@ fn main() -> std::io::Result<()> {
     println!("listening on 0.0.0.0:{PORT} (trusted-LAN dev receiver only, see PROJECT_STATUS.md)");
 
     let mut dedup = EventDedup::new_with_persistence(EVENT_DEDUP_CAPACITY, EVENT_DEDUP_PATH);
+    // Constructing this never talks to Ollama -- see `ai::OllamaAnalyzer`'s
+    // doc comment. Startup must not depend on Ollama being up. `Arc` so each
+    // event's background analysis thread (see `process_request`) can share
+    // it without cloning the underlying config/HTTP setup per event.
+    let analyzer: Arc<dyn ai::ThumbnailAnalyzer> = Arc::new(ai::OllamaAnalyzer::from_env(AI_ANALYSIS_TIMEOUT));
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_connection(stream, &mut dedup),
+            Ok(stream) => handle_connection(stream, &mut dedup, &analyzer),
             Err(e) => println!("accept error: {e}"),
         }
     }
