@@ -47,8 +47,18 @@ Return JSON only with exactly these fields:
   "package": boolean,
   "vehicle": boolean,
   "animal": boolean,
+  "concerning_object": boolean,
+  "concerning_behavior": boolean,
   "description": string,
-  "importance": "low" | "medium" | "high"
+  "plain_description": string,
+  "notable_actions": [string],
+  "concerning_details": [string],
+  "likely_intent": string,
+  "recommended_action": string,
+  "importance": "low" | "medium" | "high" | "critical",
+  "confidence": number,
+  "reason": [string],
+  "timeline": [string]
 }
 
 Rules:
@@ -58,14 +68,32 @@ Rules:
 - Do not identify anyone.
 - Do not describe race, ethnicity, gender, age, attractiveness, or other sensitive appearance traits.
 - Do not call the image a selfie.
-- Keep the description neutral, short, and security-focused.
+- Act like a blunt, practical security assistant. Say what is visibly happening; do not sanitize away important behavior.
+- description must be one short human notification sentence.
+- plain_description must be direct and specific: mention visible gestures, held objects, door/lock interaction, camera interaction, waiting, leaving, or unclear details.
+- notable_actions must list visible actions only, such as "raised middle finger", "holding a knife-like object", "standing at the door", "reaching toward the handle", or "walking past".
+- concerning_details must list specific concerns only. Use an empty array if there are no real concerns.
+- likely_intent must be a short best-effort interpretation such as "visitor", "delivery", "walk-by", "possible nuisance gesture", "possible threat", "door/camera tampering", or "unclear".
+- recommended_action must be practical, for example "No action needed", "Check the video", "Review before responding", "Do not open the door until verified", or "Consider calling for help if this is live."
+- confidence must be an integer from 0 to 100.
+- reason must contain 1 to 4 short practical reasons.
+- timeline must contain 1 to 5 short event steps inferred from the thumbnail/keyframes.
 - If a person appears in any frame, set person to true.
 - If a package appears in any frame, set package to true.
 - If a vehicle appears in any frame, set vehicle to true.
 - If an animal appears in any frame, set animal to true.
-- Set importance to high if a person or package appears near the door/camera.
-- Set importance to medium if a person/vehicle/animal appears but there is no clear concern.
-- Set importance to low if none of the tracked objects appear."#;
+- Actively look for concerning objects: knives, sharp objects, weapon-like objects, crowbars, screwdrivers, tools held near the door, or anything that could plausibly be used to threaten, force, pry, or tamper.
+- If a concerning object is visible or strongly suspected, set concerning_object to true.
+- Actively look for concerning behavior: trying the handle/lock, tampering with the door/camera, hiding face, repeated close inspection, aggressive gestures, obscene gestures such as a raised middle finger, or lingering suspiciously.
+- If concerning behavior is visible or strongly suspected, set concerning_behavior to true.
+- Use importance low for unclear/empty/walk-by events.
+- Use importance medium for a person briefly visible or ordinary vehicle/animal activity.
+- Use importance medium or high for obscene/hostile gestures depending on context and confidence; mention the gesture plainly if visible.
+- Use importance high for a person waiting near the door, a likely delivery, repeated close activity, hostile gestures close to the camera, or unexplained close interaction with the door/camera.
+- Use importance high if concerning_object is true or concerning_behavior is true.
+- Use importance critical only for urgent suspicious behavior such as someone attempting to open the door, holding a clearly weapon-like object in a threatening context, or clearly threatening activity.
+- If a knife-like/sharp object is visible, mention it clearly but neutrally in description/plain_description/reason, for example: "A person is near the door holding a sharp object."
+- If a middle finger or other obscene gesture is visible, say so directly in plain_description and notable_actions, for example: "The person appears to raise a middle finger toward the camera.""#;
 
 /// One event's AI-derived analysis -- exactly the fields the vision model
 /// is asked to return. Parsed strictly: a response that doesn't match this
@@ -76,8 +104,18 @@ pub struct EventAnalysis {
     pub package: bool,
     pub vehicle: bool,
     pub animal: bool,
+    pub concerning_object: bool,
+    pub concerning_behavior: bool,
     pub description: String,
+    pub plain_description: String,
+    pub notable_actions: Vec<String>,
+    pub concerning_details: Vec<String>,
+    pub likely_intent: String,
+    pub recommended_action: String,
     pub importance: Importance,
+    pub confidence: u8,
+    pub reason: Vec<String>,
+    pub timeline: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +124,7 @@ pub enum Importance {
     Low,
     Medium,
     High,
+    Critical,
 }
 
 /// Placeholder for a future known-person-recognition module. Deliberately
@@ -290,7 +329,7 @@ pub fn analyze_and_save(
     thumbnail_path: &Path,
     keyframe_paths: &[PathBuf],
     analysis_path: &Path,
-) {
+) -> AnalysisResult {
     let meta = |status| AiMeta {
         provider: analyzer.provider().to_string(),
         model: analyzer.model().to_string(),
@@ -309,7 +348,7 @@ pub fn analyze_and_save(
             if let Err(e) = save_analysis_json(analysis_path, &result) {
                 println!("AI analysis: failed to save {}: {e}", analysis_path.display());
             }
-            return;
+            return result;
         }
     };
 
@@ -341,6 +380,7 @@ pub fn analyze_and_save(
     if let Err(e) = save_analysis_json(analysis_path, &result) {
         println!("AI analysis: failed to save {}: {e}", analysis_path.display());
     }
+    result
 }
 
 /// Writes `analysis.json` via the same temp-file-then-rename pattern
@@ -424,8 +464,18 @@ mod tests {
             package: false,
             vehicle: false,
             animal: false,
-            description: "A person is near the camera.".to_string(),
+            concerning_object: false,
+            concerning_behavior: false,
+            description: "A visitor has been detected at your door.".to_string(),
+            plain_description: "A person is standing near the door.".to_string(),
+            notable_actions: vec!["standing near the door".to_string()],
+            concerning_details: vec![],
+            likely_intent: "visitor".to_string(),
+            recommended_action: "Check the video if needed.".to_string(),
             importance: Importance::Medium,
+            confidence: 87,
+            reason: vec!["A person appears in the event frames.".to_string()],
+            timeline: vec!["Motion started near the door.".to_string()],
         }
     }
 
@@ -454,6 +504,8 @@ mod tests {
         let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&analysis_path).unwrap()).unwrap();
         assert_eq!(saved["event_analysis"]["person"], true);
         assert_eq!(saved["event_analysis"]["importance"], "medium");
+        assert_eq!(saved["event_analysis"]["confidence"], 87);
+        assert_eq!(saved["event_analysis"]["reason"][0], "A person appears in the event frames.");
         assert_eq!(saved["identity"]["status"], "not_enabled");
         assert!(saved["identity"]["known_person_id"].is_null());
         assert_eq!(saved["ai"]["provider"], "ollama");
@@ -600,10 +652,12 @@ mod tests {
 
     #[test]
     fn parses_a_markdown_fenced_response() {
-        let fenced = "```json\n{\"person\":false,\"package\":true,\"vehicle\":false,\"animal\":false,\"description\":\"A package is on the porch.\",\"importance\":\"high\"}\n```";
+        let fenced = "```json\n{\"person\":false,\"package\":true,\"vehicle\":false,\"animal\":false,\"concerning_object\":false,\"concerning_behavior\":false,\"description\":\"This looks like a delivery.\",\"plain_description\":\"A package appears near the door.\",\"notable_actions\":[\"package left near door\"],\"concerning_details\":[],\"likely_intent\":\"delivery\",\"recommended_action\":\"Check the package when convenient.\",\"importance\":\"high\",\"confidence\":92,\"reason\":[\"A package-like object is visible.\"],\"timeline\":[\"A package appears near the door.\"]}\n```";
         let parsed = parse_event_analysis(fenced).expect("fenced JSON should still parse");
         assert_eq!(parsed.package, true);
         assert_eq!(parsed.importance, Importance::High);
+        assert_eq!(parsed.confidence, 92);
+        assert_eq!(parsed.likely_intent, "delivery");
     }
 
     #[test]

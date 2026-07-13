@@ -96,7 +96,10 @@ const THUMBNAIL_BUF_SIZE: usize = 64 * 1024;
 static THUMBNAIL_BUF: StaticCell<[u8; THUMBNAIL_BUF_SIZE]> = StaticCell::new();
 
 /// Minimum event length, regardless of how quickly PIR drops back to LOW.
-const MIN_EVENT_DURATION: Duration = Duration::from_secs(5);
+/// Raised to 10s so Telegram clips feel more like real event videos than
+/// tiny silent GIF-like snippets, and so a quick trigger still captures a
+/// little context after the person has fully entered the camera view.
+const MIN_EVENT_DURATION: Duration = Duration::from_secs(10);
 /// How long to keep recording after PIR goes LOW before ending the event --
 /// restarted from scratch any time PIR goes back HIGH before this expires.
 /// Was 2s; raised to 5s because the AM312 PIR module has roughly a 2s

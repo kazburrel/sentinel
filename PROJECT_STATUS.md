@@ -1869,8 +1869,119 @@ clip, no bounding boxes, no face recognition, `identity.status` still always
   Retention cleanup (Milestone 20) needed no changes at all -- keyframe files
   already shared the `event_<timestamp>` prefix it groups by.
 
+## Milestone 23 — event coalescing / cooldown to stop motion-burst spam
+
+Built after live testing showed one continuous real-world episode could still produce
+multiple separate uploads/`analysis.json` files in bursts. Root cause: the recording
+tail could end one clip after a short PIR-low gap, then the next PIR-high reading
+immediately started a new event even though it was still the same person/episode.
+
+- **Firmware-only fix, committed in `2bf7208` (`Fix event spam`)**: added
+  `REARM_QUIET_SECS = 15` in `firmware/src/bin/main.rs` and a pure
+  `firmware::pir::RearmGate` helper. After an event closes, the firmware now requires
+  a full 15 seconds of continuous PIR-low quiet before a new event can start. Any
+  motion during cooldown resets the quiet timer.
+- **Behavior accepted by user live testing**: quick/normal events still upload, and
+  the new cooldown behavior is acceptable for stopping bursts from one continuous
+  episode. This was tested on real hardware after flashing the fix.
+- **No server protocol/storage changes**: upload, SD queue, AI analysis, keyframe
+  extraction, retention, and event file naming remain unchanged.
+
+## Milestone 24 — actionable notifications after AI analysis
+
+First pass at the notification layer, based on common smart-doorbell alert categories
+(person/visitor, package/delivery, vehicle, animal, other motion) and the local
+privacy-first design already used for AI analysis. Scoped to the `server` crate only;
+firmware is untouched.
+
+- **New `server/src/notify.rs`**: notification policy and notifier abstraction.
+  Default policy notifies for actionable events only:
+  `person == true` OR `package == true` OR `importance == high`. Vehicle and animal
+  alerts are opt-in via env vars (`NOTIFY_VEHICLES`, `NOTIFY_ANIMALS`) because they
+  can be noisy depending on where the door faces. Low/empty motion stays local-only
+  by default.
+- **Telegram support is environment-configured, not hardcoded**:
+  `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` enable Telegram; if either is missing,
+  the server falls back to a console notifier that prints what would have been sent.
+  Telegram sends the thumbnail with a concise caption/summary; if `sendPhoto` fails,
+  it falls back to a text message.
+- **On-demand video retrieval added on top of alerts**: actionable alerts now include
+  the event ID and a Telegram inline **Send video** button whose callback payload is
+  `video:<event_id>`, so the user does not need to type a long event number. The
+  command listener also accepts `video <event_id>`, `video latest`, and `video last`;
+  it only responds to the configured `TELEGRAM_CHAT_ID`, only accepts numeric event
+  IDs (besides latest/last), and only serves files matching
+  `server/uploads/event_<id>_video.bin`. Videos are sent as Telegram documents for
+  now, because the server still stores raw recorder-frame `.bin` clips rather than a
+  standard playable MP4/AVI container.
+- **Playable video path added after live phone test**: Telegram originally sent the
+  raw `.bin`, which the phone could not play. `server/src/video.rs` now converts the
+  raw recorder-frame stream to `event_<id>_video.mp4` via local `ffmpeg`, keeping the
+  original `.bin`. Upload/AI still do not depend on conversion success. The Telegram
+  **Send video** button/`video latest` path now prefers/sends the `.mp4` and converts
+  on demand if needed.
+- **FRIDAY-style alert wording added after live screenshot review**: notifications no
+  longer expose local Mac file paths. The alert now reads like an assistant message:
+  `Project FRIDAY`, `Event #...`, a human one-sentence summary, priority, confidence,
+  detected category, short reasons, and a short timeline. The Ollama prompt/schema was
+  expanded accordingly (`confidence`, `reason`, `timeline`, plus optional `critical`
+  priority) while keeping the original booleans for notification policy.
+- **Security-concern detection tightened after knife test**: the AI schema/prompt now
+  explicitly asks for `concerning_object` and `concerning_behavior`, with rules to look
+  for knives, sharp objects, weapon-like objects, tools near the door, handle/lock
+  tampering, camera tampering, hiding, aggressive gestures, or suspicious lingering.
+  If either concern is present, notifications include a `security concern` category
+  and the model is instructed to raise priority to high/critical when appropriate.
+- **Raw scene analysis tightened after gesture test**: the AI schema/prompt now asks
+  FRIDAY to act less like a polite object classifier and more like a direct scene
+  analyst. `event_analysis` now includes `plain_description`, `notable_actions`,
+  `concerning_details`, `likely_intent`, and `recommended_action`. The prompt
+  explicitly tells the model to say visible gestures and behavior plainly, including
+  obscene gestures such as a raised middle finger, knife-like/sharp objects, door/lock
+  interaction, camera interaction, hostile gestures, waiting, leaving, or unclear
+  details. Telegram alerts now prefer `plain_description` and can show notable
+  actions, concerns, likely intent, and recommended action, so the user sees the raw
+  practical readout instead of only booleans plus a softened one-line summary.
+- **Telegram video resend guard added**: after FRIDAY successfully sends a video for
+  an event, tapping the button or requesting that same event again will not keep
+  re-sending the clip. FRIDAY replies that it was already sent; an explicit
+  `video <event_id> again` or `video latest again` forces another copy.
+- **Alert thumbnail improved**: the stored event thumbnail is still the first capture
+  at trigger time, but Telegram notifications now use a later extracted keyframe when
+  available (keyframe 1, falling back to keyframe 0, then the original thumbnail).
+  This avoids alert photos where the person has not fully stepped into frame yet.
+- **Notification runs only after `analysis.json` is saved**, using the
+  `AnalysisResult` returned by `ai::analyze_and_save`. A notification failure is only
+  logged; it never affects upload success, event storage, AI analysis, keyframe
+  extraction, or retention cleanup.
+- **Live Telegram notification verified**: a real camera event uploaded from the
+  ESP32, produced keyframes and `analysis.json`, and the server logged
+  `notification(telegram): sent`. The model result had `person: true`, `importance:
+  medium`, so it correctly notified under the actionable-event rule.
+- **Tests/checks**: server now has 58 tests passing (policy, alert formatting, strict
+  `video` command parsing/resend parsing, callback-data parsing, security concern
+  notification, and safe video-path resolution).
+  `cargo clippy -p server -- -D warnings` passes. `cargo fmt -p server` could not run
+  on this Mac because `rustfmt` is not installed for the active stable toolchain.
+
+## Milestone 25 — longer minimum clip duration
+
+Small firmware behavior tweak following Telegram playback testing: very short silent
+clips can appear GIF-like on phones. `MIN_EVENT_DURATION` in `firmware/src/bin/main.rs`
+was raised from 5 seconds to 10 seconds, so even a quick PIR trigger records a more
+normal-feeling event clip and captures more context after the subject has entered the
+camera view. Tail duration remains 5 seconds, and re-arm quiet gap remains 15 seconds.
+Firmware builds cleanly in release mode; the new duration still needs flashing to the
+ESP32 before it affects hardware behavior.
+
 ## Next steps (not yet started)
 
+- **Actionable notifications: in progress (Milestone 24).** Telegram alerting and
+  on-demand video retrieval have been live-tested. The newest raw scene-analysis
+  prompt/schema change is unit/clippy-clean but still needs one real live gesture/
+  concerning-object test before calling that specific behavior process-verified.
+- **Event coalescing/cooldown: complete (Milestone 23).** Committed in `2bf7208` and
+  accepted by user live testing on real hardware.
 - **AI analysis now covers the whole event: complete (Milestone 22).** Verified
   against a real running Ollama instance with a real multi-image event, not just
   synthetic tests -- the model's output demonstrably used both the thumbnail and
@@ -2049,7 +2160,7 @@ request. `server` had 44 tests passing; `cargo clippy -p server` clean;
 `firmware/` untouched. Verified against a real, previously-recorded 71-frame clip
 sent through the running release server, not just synthetic tests.
 
-**Uncommitted, current** (Milestone 22, described above): `server/src/ai.rs`'s
+**Committed** (`8edd102`, Milestone 22, described above): `server/src/ai.rs`'s
 `ThumbnailAnalyzer` trait renamed `EventAnalyzer` and its `analyze` method changed
 to take `images: &[&[u8]]` instead of one JPEG; `PROMPT` updated to the new
 event-level wording; `analyze_and_save` gained a `keyframe_paths` parameter.
@@ -2060,6 +2171,26 @@ with whatever it produced). `server` now has 48 tests passing; `cargo clippy -p
 server` clean; `firmware/` untouched. Verified against a real running Ollama
 instance with a real multi-image event built from 3 different real JPEGs, and a
 real thumbnail-only fallback event sent immediately after.
+
+**Committed** (`2bf7208`, Milestone 23): firmware event coalescing/cooldown fix.
+`firmware/src/bin/main.rs` adds `REARM_QUIET_SECS = 15` and waits for a real quiet
+gap before re-arming after an event; `firmware/src/pir.rs` adds `RearmGate` and
+plain-logic tests for the quiet-window behavior. User live-tested the behavior and
+accepted it.
+
+**Uncommitted, current** (Milestone 24, described above): new `server/src/notify.rs`
+(`NotificationPolicy`, console/Telegram notifier implementations, actionable-event
+rules, Telegram command/callback listener, safe `video <id>`/`video latest` retrieval);
+`server/src/ai.rs` now returns the saved `AnalysisResult` and uses the expanded raw
+scene-analysis schema (`plain_description`, `notable_actions`,
+`concerning_details`, `likely_intent`, `recommended_action`); `server/src/main.rs`
+creates the notifier/policy at startup, starts the Telegram command listener, and
+calls notification after successful AI analysis. `server/Cargo.toml` enables ureq's
+`multipart` feature so Telegram can send the thumbnail/photo, adds `dotenvy` so
+gitignored `server/.env.local` is loaded at startup, and `server/src/video.rs` can
+convert the raw recorder-frame `.bin` to a playable `.mp4` via ffmpeg for Telegram
+video requests. `server` has 58 tests passing; `cargo clippy -p server -- -D
+warnings` clean; firmware untouched for this notification/AI wording milestone.
 
 ## Hardware/tooling quirks discovered this project (useful context, not bugs to fix)
 

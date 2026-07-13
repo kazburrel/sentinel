@@ -29,13 +29,14 @@
 
 mod ai;
 mod config;
+mod notify;
 mod retention;
 mod video;
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -473,6 +474,8 @@ fn process_request(
     stream: &mut TcpStream,
     dedup: &mut EventDedup,
     analyzer: &Arc<dyn ai::EventAnalyzer>,
+    notifier: &Arc<dyn notify::Notifier>,
+    notification_policy: &notify::NotificationPolicy,
 ) -> Result<(), RequestError> {
     let peer = stream.peer_addr()?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -533,22 +536,52 @@ fn process_request(
         let thumbnail_path = thumbnail_path.clone();
         let video_path = filenames.iter().find(|f| f.ends_with("_video.bin")).cloned();
         let analyzer = Arc::clone(analyzer);
+        let notifier = Arc::clone(notifier);
+        let notification_policy = notification_policy.clone();
         std::thread::spawn(move || {
-            let keyframe_paths = video_path.map(|v| video::extract_keyframes(Path::new(&v))).unwrap_or_default();
-            ai::analyze_and_save(
+            let keyframe_paths = video_path
+                .as_deref()
+                .map(Path::new)
+                .map(|path| {
+                    let keyframes = video::extract_keyframes(path);
+                    let _ = video::convert_to_mp4(path);
+                    keyframes
+                })
+                .unwrap_or_default();
+            let result = ai::analyze_and_save(
                 analyzer.as_ref(),
                 Path::new(&thumbnail_path),
                 &keyframe_paths,
                 Path::new(&analysis_path),
             );
+            if let Some(event_analysis) = result.event_analysis.as_ref() {
+                let notification_thumbnail_path = keyframe_paths
+                    .get(1)
+                    .or_else(|| keyframe_paths.first())
+                    .map(PathBuf::as_path)
+                    .unwrap_or_else(|| Path::new(&thumbnail_path));
+                notify::maybe_notify(
+                    &notification_policy,
+                    notifier.as_ref(),
+                    event_analysis,
+                    notification_thumbnail_path,
+                    Path::new(&analysis_path),
+                );
+            }
         });
     }
 
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, dedup: &mut EventDedup, analyzer: &Arc<dyn ai::EventAnalyzer>) {
-    if let Err(e) = process_request(&mut stream, dedup, analyzer) {
+fn handle_connection(
+    mut stream: TcpStream,
+    dedup: &mut EventDedup,
+    analyzer: &Arc<dyn ai::EventAnalyzer>,
+    notifier: &Arc<dyn notify::Notifier>,
+    notification_policy: &notify::NotificationPolicy,
+) {
+    if let Err(e) = process_request(&mut stream, dedup, analyzer, notifier, notification_policy) {
         println!("request failed: {e:?}");
         let _ = stream.write_all(e.status_line().as_bytes());
         let _ = stream.write_all(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -1055,6 +1088,9 @@ const EVENT_DEDUP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/event_dedup
 const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 fn main() -> std::io::Result<()> {
+    let _ = dotenvy::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/.env.local"));
+    let _ = dotenvy::dotenv();
+
     let listener = TcpListener::bind(("0.0.0.0", PORT))?;
     println!("listening on 0.0.0.0:{PORT} (trusted-LAN dev receiver only, see PROJECT_STATUS.md)");
 
@@ -1064,6 +1100,10 @@ fn main() -> std::io::Result<()> {
     // event's background analysis thread (see `process_request`) can share
     // it without cloning the underlying config/HTTP setup per event.
     let analyzer: Arc<dyn ai::EventAnalyzer> = Arc::new(ai::OllamaAnalyzer::from_env(AI_ANALYSIS_TIMEOUT));
+    let notifier: Arc<dyn notify::Notifier> = Arc::from(notify::notifier_from_env());
+    let notification_policy = notify::NotificationPolicy::from_env();
+    println!("notifications: using {} notifier", notifier.name());
+    notify::spawn_telegram_command_listener(UPLOADS_DIR);
 
     // Runs independently of the accept loop below, for the same reason the
     // AI analysis call is never in-line: this server is single-threaded
@@ -1086,7 +1126,7 @@ fn main() -> std::io::Result<()> {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_connection(stream, &mut dedup, &analyzer),
+            Ok(stream) => handle_connection(stream, &mut dedup, &analyzer, &notifier, &notification_policy),
             Err(e) => println!("accept error: {e}"),
         }
     }

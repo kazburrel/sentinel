@@ -7,11 +7,9 @@
 //! `scripts/decode_raw_capture.py` already parses for the USB export path
 //! -- viewing one still requires this project's existing decode/assemble
 //! tooling. This module doesn't do a full video conversion (no `ffmpeg`
-//! dependency, no new external process, no new failure surface from a
-//! process that might not be installed) -- it pulls out a handful of
-//! representative JPEG stills so a future video-AI step (or a human) has
-//! something immediately viewable/consumable, deliberately deferring a
-//! full container conversion until it's clear one is actually needed.
+//! dependency for the core upload path) -- it pulls out a handful of
+//! representative JPEG stills for AI, and can also assemble the full raw
+//! clip into a phone-playable `.mp4` via `ffmpeg` when available.
 //!
 //! Runs after the event is already stored, on its own detached background
 //! thread (see `main.rs`) -- exactly like `ai::analyze_and_save`: this
@@ -23,6 +21,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// How many key frames to pull out of one clip, evenly spaced across the
 /// whole recording (including the first and last frame). Deliberately
@@ -144,6 +144,121 @@ pub fn extract_keyframes(video_path: &Path) -> Vec<PathBuf> {
         keyframes.iter().map(|f| f.timestamp_ms).collect::<Vec<_>>()
     );
     written_paths
+}
+
+/// Converts a stored raw `_video.bin` recorder-frame stream into a normal
+/// phone-playable H.264 MP4 beside it (`event_<id>_video.mp4`) using
+/// `ffmpeg`. The original `.bin` is never modified or deleted. Any failure
+/// is logged and returned as `None`: conversion is a convenience for human
+/// viewing/Telegram, never part of whether event upload/storage succeeded.
+pub fn convert_to_mp4(video_path: &Path) -> Option<PathBuf> {
+    let output_path = video_path.with_extension("mp4");
+    if output_path.is_file() {
+        return Some(output_path);
+    }
+
+    let raw = match fs::read(video_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("video: failed to read {} for mp4 conversion: {e}", video_path.display());
+            return None;
+        }
+    };
+    let frames = match parse_frames(&raw) {
+        Ok(frames) => frames,
+        Err(e) => {
+            println!("video: failed to parse {} for mp4 conversion: {e:?}", video_path.display());
+            return None;
+        }
+    };
+
+    let fps = average_fps(&frames).unwrap_or(10.0).clamp(1.0, 30.0);
+    let Some(parent) = video_path.parent() else {
+        println!("video: {} has no parent directory for mp4 conversion", video_path.display());
+        return None;
+    };
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let tmp_dir = parent.join(format!(".tmp_video_mp4_{unique}"));
+    if let Err(e) = fs::create_dir_all(&tmp_dir) {
+        println!("video: failed to create temp dir {}: {e}", tmp_dir.display());
+        return None;
+    }
+
+    let result = convert_frames_to_mp4(&frames, &tmp_dir, &output_path, fps);
+    if let Err(e) = fs::remove_dir_all(&tmp_dir) {
+        println!("video: failed to remove temp dir {}: {e}", tmp_dir.display());
+    }
+
+    match result {
+        Ok(()) => {
+            println!(
+                "video: converted {} frame(s) from {} to {} at {:.2} fps",
+                frames.len(),
+                video_path.display(),
+                output_path.display(),
+                fps
+            );
+            Some(output_path)
+        }
+        Err(e) => {
+            println!("video: mp4 conversion failed for {}: {e}", video_path.display());
+            let _ = fs::remove_file(&output_path);
+            None
+        }
+    }
+}
+
+fn average_fps(frames: &[Frame<'_>]) -> Option<f64> {
+    if frames.len() < 2 {
+        return None;
+    }
+    let first = frames.first()?.timestamp_ms;
+    let last = frames.last()?.timestamp_ms;
+    let elapsed_ms = last.checked_sub(first)?;
+    if elapsed_ms == 0 {
+        return None;
+    }
+    Some((frames.len() - 1) as f64 / (elapsed_ms as f64 / 1000.0))
+}
+
+fn convert_frames_to_mp4(frames: &[Frame<'_>], tmp_dir: &Path, output_path: &Path, fps: f64) -> Result<(), String> {
+    for (i, frame) in frames.iter().enumerate() {
+        let path = tmp_dir.join(format!("frame_{i:05}.jpg"));
+        fs::write(&path, frame.jpeg).map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
+
+    let Some(file_name) = output_path.file_name().and_then(|s| s.to_str()) else {
+        return Err(format!("invalid output file name: {}", output_path.display()));
+    };
+    let tmp_output = output_path.with_file_name(format!(".{file_name}.tmp.mp4"));
+    let input_pattern = tmp_dir.join("frame_%05d.jpg");
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-framerate")
+        .arg(format!("{fps:.3}"))
+        .arg("-i")
+        .arg(&input_pattern)
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(&tmp_output)
+        .output()
+        .map_err(|e| format!("start ffmpeg: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&tmp_output);
+        return Err(format!("ffmpeg exited with {}: {stderr}", output.status));
+    }
+
+    fs::rename(&tmp_output, output_path)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp_output.display(), output_path.display()))
 }
 
 #[cfg(test)]
