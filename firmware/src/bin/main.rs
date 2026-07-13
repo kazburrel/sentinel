@@ -7,14 +7,22 @@
 //! continues and the tail restarts. Only stops when PIR has genuinely
 //! stopped (past the tail) or PSRAM fills up. All of that is one clip;
 //! renewed motion within it never starts a second event.
+//!
+//! After a clip ends, a cooldown (`REARM_QUIET_SECS`, `firmware::pir::
+//! RearmGate`) requires the area to actually be quiet -- not just past the
+//! shorter recording tail -- before a new event is allowed to start at
+//! all. Without this, a brief PIR gap during one continuous real episode
+//! (the AM312's own post-trigger blocking period, or someone briefly
+//! pausing) would let the tail alone end the clip, and the very next PIR
+//! reading would immediately start a whole new event -- fragmenting one
+//! real episode into a burst of separate uploads. Any motion during
+//! cooldown just resets the quiet timer; only a real quiet gap re-arms.
 //! LED off, upload the event (thumbnail + video, as the `shared` crate's
 //! event envelope) to the server over WiFi (bounded retries on transient
 //! failures), then export the same clip as a raw binary dump over USB
 //! serial regardless of whether the upload succeeded -- USB export is a
 //! debugging/recovery fallback, not something the WiFi path's success or
-//! failure should ever gate. Wait for PIR to actually go LOW before
-//! rearming (so a person who's still standing there can't immediately
-//! trigger a second event).
+//! failure should ever gate.
 //!
 //! WiFi connects in the background (a dedicated supervisor task keeps
 //! retrying/reconnecting for as long as the board runs), so motion
@@ -60,7 +68,7 @@ use esp_println::{println, Printer};
 use esp_radio::wifi::{sta::StationConfig, Config as WifiConfig, Interface, WifiController};
 use firmware::camera::CameraHandle;
 use firmware::ov3660::Framesize;
-use firmware::pir::{MotionEdge, MotionSensor};
+use firmware::pir::{MotionEdge, MotionSensor, RearmGate};
 use firmware::queue::{self, DrainOutcome};
 use firmware::recorder::PsramRecorder;
 use firmware::ws2812::ws2812_frame;
@@ -95,6 +103,16 @@ const MIN_EVENT_DURATION: Duration = Duration::from_secs(5);
 /// trigger/hold plus a 2s blocking period of its own, leaving a 2s tail
 /// almost no margin against a real sensor LOW gap or missed slow movement.
 const TAIL_DURATION: Duration = Duration::from_secs(5);
+/// After an event ends, the area must stay quiet (PIR low) for this long
+/// before a new event is allowed to start -- separate from, and longer
+/// than, `TAIL_DURATION`, which only ends the *current* recording. Without
+/// this, a brief PIR gap during one continuous real motion episode (the
+/// AM312's own ~2s post-trigger blocking period, or someone briefly
+/// pausing) would let the tail alone end the event, and the very next
+/// high reading would immediately start a whole new one -- fragmenting
+/// one real episode into a burst of separate uploads/`analysis.json`
+/// files. See `firmware::pir::RearmGate`.
+const REARM_QUIET_SECS: Duration = Duration::from_secs(15);
 // No fixed maximum -- an event only ends when PIR has genuinely stopped
 // (past the tail) or PSRAM fills up, however long that takes.
 
@@ -734,13 +752,46 @@ async fn main(spawner: Spawner) -> ! {
 
                 let off = ws2812_frame(0, 0, 0);
                 channel = channel.transmit(&off).unwrap().wait().unwrap();
-                println!("waiting for PIR to go low before rearming...");
+                println!(
+                    "event #{recording_count} closed -- entering cooldown, waiting for {}s quiet before re-arming",
+                    REARM_QUIET_SECS.as_secs()
+                );
 
-                // Re-sync the debounced motion state -- if PIR is still
-                // HIGH right now (person still present), this starts with
-                // was_high=true, so no new Detected edge fires until PIR
-                // actually cycles LOW then HIGH again.
-                motion = MotionSensor::new(pir.is_high());
+                // The event's own tail logic (above) only ends once PIR has
+                // already been low for TAIL_DURATION, so PIR is guaranteed
+                // low right now -- the gate always starts already counting
+                // down. Any PIR-high reading during this loop resets it
+                // (RearmGate::update), which is what merges a brief pause-
+                // then-resume within one real motion episode into a single
+                // suppressed re-arm instead of a fresh event; only a real
+                // quiet gap opens it.
+                let cooldown_start = Instant::now();
+                let mut rearm_gate = RearmGate::start(REARM_QUIET_SECS.as_millis(), 0);
+                let mut pir_was_high_in_cooldown = false;
+                let mut last_cooldown_heartbeat = Instant::now();
+                loop {
+                    if last_cooldown_heartbeat.elapsed() >= Duration::from_secs(10) {
+                        println!("cooldown/re-arm waiting: still quieting down before a new event can start");
+                        last_cooldown_heartbeat = Instant::now();
+                    }
+                    let pir_high = pir.is_high();
+                    if pir_high && !pir_was_high_in_cooldown {
+                        println!("cooldown/re-arm waiting: motion detected during cooldown, quiet timer reset");
+                    }
+                    pir_was_high_in_cooldown = pir_high;
+
+                    let now_ms = cooldown_start.elapsed().as_millis();
+                    if rearm_gate.update(pir_high, now_ms) {
+                        break;
+                    }
+                    Timer::after(Duration::from_millis(50)).await;
+                }
+                println!("re-armed after {}s quiet gap", REARM_QUIET_SECS.as_secs());
+
+                // PIR is guaranteed low here (that's what just opened the
+                // gate), so this always starts with was_high=false -- the
+                // next real motion is a genuinely new episode.
+                motion = MotionSensor::new(false);
             }
             Some(MotionEdge::Stopped) => {
                 println!("motion stopped");
