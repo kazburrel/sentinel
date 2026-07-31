@@ -96,7 +96,7 @@ breakthrough, and is now in a fresh, well-understood-but-unsolved state. Read in
 New file `firmware/src/ov3660.rs`: a from-scratch OV3660 SCCB driver, ported from
 Espressif's real `esp32-camera` library (`sensors/ov3660.c`,
 `sensors/private_include/ov3660_settings.h`/`ov3660_regs.h`) — **not hand-transcribed**,
-extracted programmatically with a Python script to avoid copy-transcription errors
+extracted programmatically with a one-off host tool to avoid copy-transcription errors
 (a real bug was caught and fixed this way: the first extraction pass incorrectly
 included 16 commented-out register entries from the source file; a second pass that
 strips `//` comments before parsing fixed it — final table is 199 register-writes,
@@ -238,7 +238,7 @@ real hardware:
   serial-transport helper (hex-encode + `JPEG BEGIN`/`JPEG END` framing markers) shared
   by both `main.rs` and `camera_test.rs` — kept separate from `camera.rs` since framing
   bytes for serial debug output is a transport concern, not a camera concern.
-- **New `scripts/capture_photo.sh` + `scripts/decode_capture.py`**: a local dev/test
+- **New `scripts/capture_photo.sh` + Rust `decode-capture` command**: a local dev/test
   tool (not part of firmware) that listens to the board's serial port, waits for you to
   trigger the PIR sensor, polls for a completed `JPEG END` marker (rather than always
   sleeping a fixed window), decodes the hex dump into a real `.jpg`, and opens it
@@ -261,7 +261,7 @@ verified on real hardware. Committed in `cafe716`.
   back-to-back, hex-dumping each one immediately *after* it's captured (safe — no DMA
   transfer is in-flight while dumping, unlike printing *during* one). Host-side,
   `scripts/capture_video.sh` waits for the board's `MJPEG CAPTURE DONE` marker,
-  extracts frames via `scripts/decode_capture.py` (now always numbers frames
+  extracts frames via the Rust `decode-capture` command (now always numbers frames
   `_0.jpg`/`_1.jpg`/... , even a single frame, for a consistent ffmpeg input pattern),
   then assembles them into a real video via `ffmpeg`.
   - **First attempt produced an MJPEG-codec `.avi`** — the frames and assembled video
@@ -397,8 +397,8 @@ is avoided by construction, not by discipline.
   (a 64KB `StaticCell`, same as earlier tests) -- only the already-complete JPEG gets
   copied into PSRAM, avoiding any PSRAM-DMA-alignment question entirely since it's a
   plain CPU `copy_from_slice`, not a DMA transfer into PSRAM.
-- **`scripts/decode_raw_capture.py`** (new): parses the raw binary export (distinct
-  from `decode_capture.py`'s hex-text parser) and computes **FPS from real per-frame
+- **Rust `decode-raw` command** (new): parses the raw binary export (distinct
+  from `decode-capture`'s hex-text parser) and computes **FPS from real per-frame
   timestamps** recorded on-device, not an estimate.
 - **`scripts/capture_psram_video.sh`** (new): waits for `RAW EXPORT END`, decodes,
   assembles via `ffmpeg` into `.mp4`. Per explicit user request, individual frame files
@@ -442,7 +442,7 @@ first, not yet folded into `main.rs`.
 - **Verified the full export-to-video path still works** with this trigger source, not
   just the boot-triggered one: decoded and assembled two separate motion-triggered
   recordings into playable `.mp4`s (640x480, ~5.05s each, 12-12.5 FPS measured from real
-  timestamps) via the existing `decode_raw_capture.py`/`ffmpeg` pipeline.
+  timestamps) via the existing `decode-raw`/`ffmpeg` pipeline.
 - Per explicit request, `scripts/capture_psram_video.sh` (already built in Milestone 7)
   works unchanged for this trigger source too -- flash `motion_record_test`, run the
   script, wave, and it waits for the `RAW EXPORT END` marker and produces a video on
@@ -1063,7 +1063,7 @@ side).
   tests don't touch real uploads). All pass (`cargo test -p server`, 7 total including
   Milestone 13's).
 - **Verified end-to-end with a real JPEG before touching hardware**: built an envelope
-  body from a real JPEG in Python, POSTed it via `curl` to a locally running server,
+  body from a real JPEG with a one-off host tool, POSTed it via `curl` to a locally running server,
   confirmed the stored file was byte-identical to the source and opened correctly --
   caught any integration mistakes before involving the board at all.
 - **`firmware/src/bin/event_upload_video_test.rs`, new**: adds a recorded video clip
@@ -1072,14 +1072,14 @@ side).
   `psram_record_test.rs`), and uploads both as a two-part envelope (`Thumbnail` +
   `Video`) in one HTTP POST. The video part's payload is
   `PsramRecorder::recorded_bytes()` verbatim -- the same `[frame_len: u32 LE]
-  [timestamp_ms: u32 LE][JPEG bytes]` per-frame format `scripts/decode_raw_capture.py`
+  [timestamp_ms: u32 LE][JPEG bytes]` per-frame format the Rust `decode-raw` command
   already parses, just delivered over WiFi instead of serial, so no new decode logic
   was needed. **Verified on real hardware**: 3 consecutive events, each 70 frames
   (~747KB) recorded at the expected ~13.9 FPS (matching Milestone 7's measured PSRAM
   copy overhead) plus a ~10.6KB thumbnail, all `200 OK`, both parts stored under a
-  shared timestamp. Decoded the video part with `decode_raw_capture.py` (wrapped in the
-  `RAW EXPORT BEGIN <n>` marker it expects, since that script was written for a serial
-  log, not a bare file -- no script changes needed) -- all 70 frames extracted cleanly,
+  shared timestamp. Decoded the video part with `decode-raw` (wrapped in the
+  `RAW EXPORT BEGIN <n>` marker it expects, since that command consumes a serial
+  log rather than a bare file) -- all 70 frames extracted cleanly,
   no truncation warnings, assembled into a real H.264 `.mp4` via `ffmpeg` (confirmed via
   `ffprobe`: 640x480, 70 frames, ~5.04s) and one frame opened and visually confirmed as
   a real photo, not corrupt data. Test uploads and decoded artifacts were deleted
@@ -1144,7 +1144,7 @@ itself changed):
   ~2MB clips this time -- a more detailed scene than the first pass, not a regression),
   video part's logged `timestamp_ms`/`duration_ms` matched the real measured
   capture-to-record-start gap (~134-146ms) and recording length (~5043-5044ms); decoded
-  one clip with `decode_raw_capture.py` (all 70 frames, no truncation warnings) and
+  one clip with `decode-raw` (all 70 frames, no truncation warnings) and
   visually confirmed a real frame. No `.tmp` files left behind after successful
   commits. Test uploads deleted afterward.
 
@@ -1247,7 +1247,7 @@ that logic living only in a standalone test binary.
     the doorbell state machine's variable duration, not a fixed test-binary duration) and
     #2: server running -> **WiFi upload SUCCEEDED**, both parts stored server-side and
     confirmed valid (thumbnail opens as a real JPEG -- visually confirmed, a real photo
-    of a ceiling; video decodes cleanly via `decode_raw_capture.py`, 55/91/110 frames
+    of a ceiling; video decodes cleanly via `decode-raw`, 55/91/110 frames
     depending on event, no truncation warnings).
   - Server killed, event #3 triggered: **WiFi upload FAILED -- could not connect to
     server**, logged cleanly, no crash/hang -- USB export still ran (confirmed
@@ -1761,7 +1761,7 @@ key frames turn out to be insufficient once real video-AI work starts.
 
 - **New `server/src/video.rs`**: `extract_keyframes(video_path)` reads a stored
   `event_<timestamp>_video.bin`, parses every frame with the same `[frame_len: u32
-  LE][timestamp_ms: u32 LE][jpeg bytes]` logic `scripts/decode_raw_capture.py`
+  LE][timestamp_ms: u32 LE][jpeg bytes]` logic in the Rust `decode-raw` command
   already uses for the USB-export path (the network-uploaded `.bin` file is that
   same byte sequence directly, no enclosing marker), and writes up to
   `MAX_KEYFRAMES` (6) representative stills as `event_<timestamp>_keyframe_<n>.jpg`
@@ -1990,113 +1990,8 @@ firmware is untouched.
   visible overlay instead of silently falling back to plain video. The generated file
   name changed to `event_<id>_locked.mp4` so stale earlier annotated files are not
   reused. This AI-region path is still not full per-frame tracking; it is event-level
-  lock boxes from AI-provided coordinates, kept as a fallback behind the real tracker
-  sidecar described next.
-- **Real YOLO/ByteTrack sidecar added for actual locked boxes**: after Fable's
-  research confirmed that Qwen/ffmpeg prompting cannot produce true lock-on boxes,
-  added `scripts/track_video.py` plus `scripts/requirements-tracker.txt`. The Rust
-  server now tries this sidecar first when Telegram sends a video: it runs local
-  Ultralytics YOLO tracking (`yolo11m.pt` by default, ByteTrack, low confidence),
-  writes `event_<id>_tracks.json`, and renders `event_<id>_locked.mp4` with per-frame
-  boxes burned in. `.venv-tracker/` is gitignored and the server auto-uses
-  `.venv-tracker/bin/python` when present. Verified on the old knife event
-  `1783956503532`: the initial YOLO-only pass generated 108 frames / 211 detections,
-  with white person lock and a red object/knife-like lock on the blade area (YOLO
-  labelled the blade-like object as `scissors` in one frame, but the red box is on the
-  concerning object). The older ffmpeg/AI-region overlay remains as fallback if the
-  tracker sidecar or dependencies fail.
-- **Face/head lock fixed after live review**: the first tracker pass derived
-  `FACE/HEAD` from the top of the YOLO person box, which failed badly with the
-  sideways camera angle (the face box could sit over the torso/arm). The tracker
-  sidecar now uses OpenCV YuNet (`scripts/models/face_detection_yunet_2023mar.onnx`,
-  kept local/gitignored) and runs face detection across 0/90/180/270-degree rotated
-  frame views, mapping detections back to the original 640x480 frame. The face box now
-  appears only when the face is actually detected and disappears when it leaves/fails
-  detection. Re-verified on knife event `1783956503532`: the regenerated locked video
-  produced 108 frames / 242 detections, with YuNet face detections in 93/108 frames,
-  plus the red blade/object lock.
-- **Threat-level color policy added**: tracker rendering now accepts an event-level
-  `--threat-level normal|minimal|threat`, and the Rust server derives that from
-  `analysis.json` when calling the sidecar. Normal events keep person/face boxes
-  white. Concerning behavior without a weapon/object (e.g. hostile/obscene gesture)
-  becomes `minimal` and colors person/face yellow with `FRIDAY LOCK - MINIMAL THREAT`.
-  Concerning object or `critical` events become `threat` and color person/face red
-  with `FRIDAY LOCK - THREAT`; knife/object boxes remain red. Cached outputs are
-  separated by filename (`*_locked_normal.mp4`, `*_locked_minimal.mp4`,
-  `*_locked_threat.mp4`) so a previous color state is not reused. Re-generated the
-  middle-finger event `1783957936278` as minimal/yellow and the knife event
-  `1783956503532` as threat/red; face duplicate boxes were reduced by assigning only
-  one YuNet face box per tracked person.
-- **Frame-aware threat coloring added after live review**: event `1784135006831`
-  revealed that the prior event-level `threat` color made the video start with red
-  face/person boxes even before any concerning object appeared. `scripts/track_video.py`
-  now computes a `rendered_threat_level` per frame: normal/white when no threat object
-  is visible, red only on frames where YOLO detects a concerning object (`knife`,
-  `scissors`, `baseball bat`, etc.), and yellow remained the event-level fallback for
-  gesture-only/minimal-threat events at that stage. Tracker output filenames were bumped to
-  `*_locked_frame_<level>.mp4` / `*_tracks_frame_<level>.json` so old cached all-red
-  locked videos are not reused. Re-generated `1784135006831`: 292/301 frames rendered
-  normal/white, 9/301 rendered threat/red, with the first frame visually confirmed
-  white and the object frame confirmed red.
-- **Stable body/face locks added after live wobble review**: ByteTrack IDs alone did
-  not make the rendered lock stable because raw YOLO coordinates were still drawn
-  independently on every frame, while YuNet redetected faces independently on every
-  frame. `scripts/track_video.py` now keeps temporal body state per ByteTrack ID,
-  smooths body center and size, limits implausible one-frame jumps, predicts through
-  five-frame detector gaps, and suppresses a held old ID when ByteTrack replaces it
-  with an overlapping live ID. Face boxes are now smoothed in coordinates relative
-  to their stabilized body, so a briefly held face follows its person instead of
-  freezing or lagging in screen space. Raw coordinates remain in each detection's
-  `raw_box` for comparison/debugging, with `held` and `stabilized` flags. Four-rotation
-  YuNet false positives are filtered by body-relative size and upper-body position;
-  unassociated one-frame face boxes are no longer rendered. Defaults are tunable
-  without code changes through `FRIDAY_BODY_SMOOTHING`,
-  `FRIDAY_FACE_SMOOTHING`, and `FRIDAY_TRACK_HOLD_FRAMES`. Cache outputs were bumped
-  to `*_locked_stable_<level>.mp4` / `*_tracks_stable_<level>.json`, while Telegram's
-  event parser keeps accepting every older locked filename. On real 301-frame event
-  `1784135006831`, high-frequency coordinate movement fell 63.0% for the body and
-  68.2% for the face; visual contact-sheet review also caught and removed a prior
-  torso-sized false face box. The run produced 291 live + 5 held person detections
-  and 199 live + 48 held face detections. Seven focused Python tests cover smoothing,
-  short holds, ID replacement, body-relative face following, false-face filtering,
-  and threat-latch independence.
-- **Frame-level gesture and faster visible-knife response added**: the tracker now
-  depends on MediaPipe Hands and classifies a raised middle finger from 21 hand
-  landmarks on every frame using orientation-independent joint angles. It explicitly
-  requires the middle finger extended and index/ring/pinky folded, so a peace sign is
-  not treated as an obscene gesture. Evidence must appear on two consecutive frames;
-  the first candidate is backfilled from the bounded render buffer, the matched
-  canonical person ID becomes yellow immediately, and yellow holds for 18 frames.
-  Red object threat always overrides yellow. The detector degrades to the existing
-  event-level AI context if MediaPipe is unavailable or fails. Clip orientation is
-  now chosen once from YuNet face confidence across sampled 0/90/180/270-degree
-  views, so older sideways recordings are rotated upright before YOLO, face, and hand
-  tracking. Nested duplicate person boxes are suppressed, and overlapping ByteTrack
-  replacement IDs are remapped to the existing canonical person ID so gesture state
-  and box smoothing survive an ID switch. For small concerning objects, YOLO inference
-  increased from its default 640 grid to 960. On real knife event `1784135006831`,
-  first object recognition moved from frame 167 to frame 146. Because the video is
-  rendered offline, an 18-frame bounded buffer recolors only person/face boxes before
-  that delayed recognition (never fabricating an object box), placing first red at
-  frame 128 -- where the knife first becomes visibly clear around frame 130. The same
-  mixed gesture+knife clip found the middle finger on frames 79-101, began yellow at
-  frame 79, switched to red for the visible knife episode, then decayed to yellow as
-  intended. Real gesture event `1783957936278` auto-rotated 270 degrees upright and
-  local gesture detection produced yellow on 64/82 frames even when the test
-  deliberately passed event threat level `normal`. New outputs are versioned as
-  `*_locked_reactive_<level>.mp4` / `*_tracks_reactive_<level>.json`; all prior cache
-  names remain parseable. Eleven Python tests cover box stabilization/identity bridging,
-  false-face and duplicate-person filtering, gesture geometry/debouncing/priority,
-  and threat latching.
-- **Clear-human Telegram alert photo added**: Telegram no longer has to use the first
-  PIR trigger thumbnail or a fixed later keyframe. Added `scripts/select_alert_frame.py`,
-  a lightweight YuNet face-selector sidecar that scans the extracted keyframes (with
-  0/90/180/270-degree rotated face detection for the sideways camera view), chooses the
-  frame with the best visible face/head, and writes `event_<id>_alert.jpg`. The server
-  now tries that file for the initial Telegram `sendPhoto`, falling back to keyframe 1,
-  keyframe 0, then the original thumbnail if no face is found or the sidecar fails.
-  Verified on knife event `1783956503532`: selected `keyframe_1` and produced a clear
-  human alert image with face/object visible.
+  lock boxes from AI-provided coordinates, kept as a fallback behind the Rust tracker.
+- **Historical lock-on iterations (superseded)**: early per-frame tracking, face-lock smoothing, gesture coloring, threat pre-roll, and alert-frame selection experiments established the behavior now implemented directly in Rust. Their generated cache filenames remain parseable for old stored events, but none of the retired runtime or dependency stack remains in the repository.
 - **Alert thumbnail improved**: the stored event thumbnail is still the first capture
   at trigger time, but Telegram notifications now use a later extracted keyframe when
   available (keyframe 1, falling back to keyframe 0, then the original thumbnail).
@@ -2131,13 +2026,13 @@ ESP32 before it affects hardware behavior.
 Added conservative, fully local known-person recognition without changing the proven
 PIR, recording, upload, SD queue, or Telegram timing sequence.
 
-- **Local-only YuNet + SFace pipeline**: new `scripts/face_identity.py` detects and
-  aligns faces across the thumbnail/keyframes (including 0/90/180/270-degree camera
-  orientations), generates normalized SFace embeddings, and matches those embeddings
-  against local identity profiles. The official OpenCV Zoo YuNet/SFace models and
-  their SHA-256 hashes are documented under `scripts/models/`; both are Apache-2.0.
+- **Local-only YuNet + SFace pipeline**: `server/src/vision.rs` detects and aligns
+  faces across the thumbnail/keyframes (including 0/90/180/270-degree camera
+  orientations), generates normalized SFace embeddings, and matches them against
+  local identity profiles. ONNX inference, image preparation, alignment, and matching
+  all execute inside the Rust process through `tract-onnx`.
 - **Private enrollment**: confirmed event `1784135006831` was enrolled as person ID
-  `admin`, display name `Kaz`, from six usable event frames. Only embeddings are
+  `admin`, display name `Kaz`, from five usable event frames. Only embeddings are
   stored in `server/identities/admin.json`; the profile directory is mode `0700`, the
   profile is mode `0600`, and `server/identities/` is gitignored so biometric data is
   never pushed. Enrollment photos are never copied into the profile.
@@ -2145,7 +2040,7 @@ PIR, recording, upload, SD queue, or Telegram timing sequence.
   images confirm identity, or one image must pass the stricter `0.65` threshold.
   Weak/blurred faces remain `unknown`, missing faces become `no_face`, and any frame
   containing multiple faces becomes `multiple_faces` so Kaz standing beside an
-  unknown visitor can never suppress the visitor alert. Any model, sidecar, or profile
+  unknown visitor can never suppress the visitor alert. Any model, inference, or profile
   failure fails open as an ordinary unknown-person alert rather than suppressing it.
   Thresholds can be tuned with `FRIDAY_FACE_MATCH_THRESHOLD` and
   `FRIDAY_FACE_STRONG_MATCH_THRESHOLD`.
@@ -2166,19 +2061,38 @@ PIR, recording, upload, SD queue, or Telegram timing sequence.
   a confident Kaz match suppresses that alert while retaining the objective analysis.
   The synthetic replay artifacts were removed afterward. No development notification
   was sent to the real chat.
-- **Checks**: 72 server tests + 12 shared tests pass, including full Kaz suppression,
-  identity parsing/validation, and identity persistence through AI.
-  Sixteen Python identity/tracking tests pass; Python compile and
-  `cargo clippy -p server -- -D warnings` are clean.
+- **Checks**: 78 server tests + 12 shared tests pass, including full Kaz suppression,
+  identity matching, and identity persistence through AI.
 
 To replace or expand the local admin profile, run from the repository root:
 
 ```sh
-.venv-tracker/bin/python scripts/face_identity.py enroll \
-  --person-id admin --display-name Kaz \
-  --output server/identities/admin.json \
+cargo run --release -p server -- enroll-face admin Kaz server/identities/admin.json \
   /path/to/clear-admin-frame-1.jpg /path/to/clear-admin-frame-2.jpg
 ```
+
+## Milestone 27 — production vision migrated completely to Rust
+
+- Removed every former dynamic-language source file, package manifest, interpreter
+  launch, virtual environment, bytecode cache, and framework-specific weight from the
+  project. The remaining operational shell wrappers invoke the Rust binary only.
+- Added a pure-Rust `tract-onnx` vision engine for YuNet face detection, SFace
+  embeddings, and YOLO11 object/person inference. All required ONNX models and hashes
+  are maintained under `scripts/models/`.
+- Replaced the retired external video worker with Rust IoU tracking, center/size EMA stabilization,
+  velocity-based short-gap holds, body-relative face locks, duplicate suppression,
+  frame-aware object threat pre-roll/hold, and in-process overlay rendering. Behavior
+  analysis backfills yellow from the start of a gesture-classified clip, avoiding the
+  former delayed color transition.
+- A confidently recognized Kaz renders green as `KAZ / ADMIN`; the objectively
+  detected knife/object may remain red, but Kaz's body and face are never rendered as
+  dangerous and the event sends no automatic notification.
+- Rust CLI subcommands replace the former host utilities: `decode-capture`,
+  `decode-raw`, `send-test-event`, `enroll-face`, `recognize-face`, and `track-video`.
+- Real replay acceptance: Kaz matched at cosine confidence `1.0`. The 301-frame event
+  `1784135006831` produced a playable Rust-locked MP4 and `friday.tracks.v2` JSON with
+  194 face detections and 17 knife detections. The optimized first pass completed in
+  1m44s on the development Mac.
 
 ## Next steps (not yet started)
 
@@ -2222,8 +2136,8 @@ To replace or expand the local admin profile, run from the repository root:
   endpoint (structured per-part storage is now done, per Milestone 14) once there's an
   actual second concern to route to (e.g. an AI-processing trigger or a query endpoint).
 - Decide a real container format for the video part once it's time to make clips
-  independently playable server-side without a decode script (currently `.bin`,
-  requiring `decode_raw_capture.py`-style parsing) -- e.g. actual MJPEG/AVI muxing, or
+  independently playable server-side without the Rust decode command (currently
+  `.bin`, requiring `decode-raw`-style parsing) -- e.g. actual MJPEG/AVI muxing, or
   running the existing ffmpeg assembly step directly in the `server` crate after
   storage.
 - Optionally investigate the FPS gap noted in Milestone 7 (PSRAM copy overhead: ~12-14
@@ -2349,7 +2263,7 @@ build/test level only -- not yet a real hardware pass (see Milestone 18 above).
 `Arc<dyn ThumbnailAnalyzer>` through `process_request`/`handle_connection`/`main`, and
 spawns a detached background thread per event for the analysis call (never in-line,
 per the single-threaded-accept-loop finding above); `server/Cargo.toml` gained `ureq`
-(`json` feature), `serde`/`serde_json`, `base64`; new `scripts/send_test_event.py` dev
+(`json` feature), `serde`/`serde_json`, `base64`; new Rust `send-test-event` dev
 tool. `firmware/` untouched.
 
 **Committed** (`8ff4e1c`, Milestone 20): new `server/src/retention.rs`

@@ -705,7 +705,10 @@ fn event_id_for_playable_video_path(path: &Path) -> Option<String> {
         .or_else(|| rest.strip_suffix("_locked_stable_threat.mp4"))
         .or_else(|| rest.strip_suffix("_locked_reactive_normal.mp4"))
         .or_else(|| rest.strip_suffix("_locked_reactive_minimal.mp4"))
-        .or_else(|| rest.strip_suffix("_locked_reactive_threat.mp4"))?;
+        .or_else(|| rest.strip_suffix("_locked_reactive_threat.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_rust_normal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_rust_minimal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_rust_threat.mp4"))?;
     (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string())
 }
 
@@ -740,16 +743,20 @@ fn annotate_video_if_possible(uploads_dir: &Path, video_path: &Path) -> PathBuf 
     let Some(event_id) = event_id_for_playable_video_path(video_path) else {
         return video_path.to_path_buf();
     };
-    let Some((_, analysis, _)) = analysis_for_event(uploads_dir, &event_id) else {
+    let Some((_, analysis, identity)) = analysis_for_event(uploads_dir, &event_id) else {
         return video_path.to_path_buf();
     };
-    if let Some(locked_path) =
-        video::lock_mp4_with_tracker(video_path, tracker_threat_level(&analysis), analysis.concerning_behavior)
-    {
+    let trusted_admin = identity.is_known();
+    if let Some(locked_path) = video::lock_mp4_with_tracker(
+        video_path,
+        tracker_threat_level(&analysis),
+        analysis.concerning_behavior,
+        trusted_admin,
+    ) {
         return locked_path;
     }
-    let labels = overlay_labels_for_analysis(&analysis);
-    let regions = overlay_regions_for_analysis(&analysis);
+    let labels = overlay_labels_for_analysis(&analysis, trusted_admin);
+    let regions = overlay_regions_for_analysis(&analysis, trusted_admin);
     video::annotate_mp4(video_path, &labels, &regions).unwrap_or_else(|| video_path.to_path_buf())
 }
 
@@ -763,8 +770,11 @@ fn tracker_threat_level(analysis: &EventAnalysis) -> video::TrackerThreatLevel {
     video::TrackerThreatLevel::Normal
 }
 
-fn overlay_labels_for_analysis(analysis: &EventAnalysis) -> Vec<video::OverlayLabel> {
+fn overlay_labels_for_analysis(analysis: &EventAnalysis, trusted_admin: bool) -> Vec<video::OverlayLabel> {
     let mut labels = Vec::new();
+    if trusted_admin {
+        labels.push(video::OverlayLabel::new("KAZ / ADMIN", video::OverlayColor::Green));
+    }
     if analysis.concerning_object {
         labels.push(video::OverlayLabel::new("CONCERNING OBJECT", video::OverlayColor::Red));
     }
@@ -772,7 +782,9 @@ fn overlay_labels_for_analysis(analysis: &EventAnalysis) -> Vec<video::OverlayLa
         labels.push(video::OverlayLabel::new("CONCERNING BEHAVIOR", video::OverlayColor::Red));
     }
     if analysis.person {
-        let color = if analysis.concerning_object || analysis.concerning_behavior {
+        let color = if trusted_admin {
+            video::OverlayColor::Green
+        } else if analysis.concerning_object || analysis.concerning_behavior {
             video::OverlayColor::Red
         } else if matches!(analysis.importance, Importance::High | Importance::Critical) {
             video::OverlayColor::Yellow
@@ -802,7 +814,7 @@ fn overlay_labels_for_analysis(analysis: &EventAnalysis) -> Vec<video::OverlayLa
     labels
 }
 
-fn overlay_regions_for_analysis(analysis: &EventAnalysis) -> Vec<video::OverlayRegion> {
+fn overlay_regions_for_analysis(analysis: &EventAnalysis, trusted_admin: bool) -> Vec<video::OverlayRegion> {
     let mut regions: Vec<video::OverlayRegion> = analysis
         .regions
         .iter()
@@ -811,7 +823,11 @@ fn overlay_regions_for_analysis(analysis: &EventAnalysis) -> Vec<video::OverlayR
         .map(|region| {
             video::OverlayRegion::new(
                 region_label(region),
-                region_color(analysis, region.kind),
+                if trusted_admin && matches!(region.kind, RegionKind::Person | RegionKind::Face) {
+                    video::OverlayColor::Green
+                } else {
+                    region_color(analysis, region.kind)
+                },
                 region.x.min(1000),
                 region.y.min(1000),
                 region.w.min(1000),
@@ -823,7 +839,11 @@ fn overlay_regions_for_analysis(analysis: &EventAnalysis) -> Vec<video::OverlayR
     if regions.is_empty() && (analysis.concerning_object || analysis.concerning_behavior) {
         regions.push(video::OverlayRegion::new(
             "FACE / HEAD",
-            video::OverlayColor::Red,
+            if trusted_admin {
+                video::OverlayColor::Green
+            } else {
+                video::OverlayColor::Red
+            },
             570,
             100,
             320,
@@ -1676,7 +1696,11 @@ mod tests {
     }
 
     #[test]
-    fn resolves_event_id_from_reactive_and_older_locked_videos() {
+    fn resolves_event_id_from_rust_and_older_locked_videos() {
+        assert_eq!(
+            event_id_for_playable_video_path(Path::new("event_123_locked_rust_threat.mp4")),
+            Some("123".to_string())
+        );
         assert_eq!(
             event_id_for_playable_video_path(Path::new("event_123_locked_reactive_threat.mp4")),
             Some("123".to_string())

@@ -45,7 +45,9 @@ kill "$CAT_PID" 2>/dev/null || true
 wait "$CAT_PID" 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FILES=$(python3 "$SCRIPT_DIR/decode_capture.py" "$LOG" "$OUT_PREFIX") || true
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FILES=$(cargo run --quiet --release --manifest-path "$REPO_ROOT/Cargo.toml" -p server -- \
+    decode-capture "$LOG" "$OUT_PREFIX") || true
 
 if [ -z "$FILES" ]; then
     echo "no photo captured in that window -- try again, wave your hand sooner/longer"

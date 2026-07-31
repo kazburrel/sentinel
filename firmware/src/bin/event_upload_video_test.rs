@@ -6,7 +6,7 @@
 //!
 //! The video part's payload is `PsramRecorder::recorded_bytes()` verbatim --
 //! the same `[frame_len: u32 LE][timestamp_ms: u32 LE][JPEG bytes]`
-//! per-frame format `scripts/decode_raw_capture.py` already knows how to
+//! per-frame format the Rust server's `decode-raw` command already knows how to
 //! turn into a playable clip, just delivered over WiFi instead of serial.
 //!
 //! Wiring (Freenove ESP32-S3 CAM, confirmed working pin map, see

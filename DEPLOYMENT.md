@@ -91,12 +91,12 @@ Before a real-media release, also verify:
 - `server/identities/` remains gitignored and readable only by the service account;
   identity profiles contain biometric embeddings and must not enter source control,
   images, logs, backups, or hosted deployments without an explicit privacy decision.
-- Both OpenCV face models exist under `scripts/models/`, their SHA-256 hashes match
-  `scripts/models/README.md`, and the configured Python environment provides the
-  pinned OpenCV version from `scripts/requirements-tracker.txt`.
+- All three ONNX vision models exist under `scripts/models/`, their SHA-256 hashes
+  match `scripts/models/README.md`, and the release binary was built with the pinned
+  Rust `tract-onnx` dependency from `Cargo.lock`.
 - A confident Kaz/admin match suppresses notification for both routine and
   threat-classified events. Weak, unknown, multiple-face, missing-model, missing-profile,
-  or failed-sidecar results must never silently suppress a notification.
+  or failed-inference results must never silently suppress a notification.
 
 ### Firmware gate
 

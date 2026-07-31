@@ -6,7 +6,7 @@
 # Assumes `mjpeg_test` (not `firmware`/main.rs) is already flashed and
 # running -- it captures a fixed number of frames on boot, hex-dumping each
 # one to serial right after capture. This script waits for the "MJPEG
-# CAPTURE DONE" marker, extracts each frame via decode_capture.py, then uses
+# CAPTURE DONE" marker, extracts each frame via the Rust server utility, then uses
 # ffmpeg to assemble them into an H.264 .mp4 at the camera's actual
 # capture-only FPS (reported by the firmware, excluding serial transmission
 # time) so the video plays back at a realistic speed.
@@ -26,6 +26,7 @@ if [ -z "$PORT" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG="$(mktemp -t capture_video).log"
 # Individual burst frames are throwaway intermediates -- keep them in a temp
 # dir (auto-cleaned below) instead of cluttering the Desktop. Only the final
@@ -69,7 +70,8 @@ FPS=$(grep -o "camera FPS: [0-9.]*" "$LOG" | tail -1 | awk '{print $3}')
 FPS="${FPS:-5}"
 echo "camera-reported FPS: $FPS"
 
-FILES=$(python3 "$SCRIPT_DIR/decode_capture.py" "$LOG" "$FRAME_PREFIX") || true
+FILES=$(cargo run --quiet --release --manifest-path "$REPO_ROOT/Cargo.toml" -p server -- \
+    decode-capture "$LOG" "$FRAME_PREFIX") || true
 
 if [ -z "$FILES" ]; then
     echo "no frames found in log -- see $LOG"

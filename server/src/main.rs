@@ -32,7 +32,9 @@ mod config;
 mod identity;
 mod notify;
 mod retention;
+mod tools;
 mod video;
+mod vision;
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -1096,6 +1098,11 @@ const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 fn main() -> std::io::Result<()> {
     let _ = dotenvy::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/.env.local"));
     let _ = dotenvy::dotenv();
+
+    let arguments: Vec<String> = std::env::args().collect();
+    if let Some(result) = tools::run_if_requested(&arguments) {
+        return result.map_err(std::io::Error::other);
+    }
 
     let listener = TcpListener::bind(("0.0.0.0", PORT))?;
     println!("listening on 0.0.0.0:{PORT} (trusted-LAN dev receiver only, see PROJECT_STATUS.md)");

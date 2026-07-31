@@ -8,7 +8,7 @@
 # fixed-duration burst of frames straight into PSRAM with no serial output at
 # all during recording, then exports the whole clip as one raw binary dump
 # afterward. This script waits for the "RAW EXPORT END" marker, extracts
-# frames via decode_raw_capture.py (real per-frame timestamps -> accurate
+# frames via the Rust decoder (real per-frame timestamps -> accurate
 # FPS, not a guess), assembles them into an H.264 .mp4 via ffmpeg, and opens
 # it. Individual frame files are kept in a temp dir and deleted afterward --
 # only the final video is saved to the Desktop.
@@ -23,6 +23,7 @@ if [ -z "$PORT" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG="$(mktemp -t capture_psram_video).log"
 FRAME_DIR="$(mktemp -d -t capture_psram_video_frames)"
 OUT_DIR="$HOME/Desktop"
@@ -59,7 +60,8 @@ if ! grep -q "RAW EXPORT END" "$LOG" 2>/dev/null; then
     exit 1
 fi
 
-DECODE_OUT=$(python3 "$SCRIPT_DIR/decode_raw_capture.py" "$LOG" "$FRAME_PREFIX") || true
+DECODE_OUT=$(cargo run --quiet --release --manifest-path "$REPO_ROOT/Cargo.toml" -p server -- \
+    decode-raw "$LOG" "$FRAME_PREFIX") || true
 
 if [ -z "$DECODE_OUT" ]; then
     echo "no frames found in raw export -- see $LOG"

@@ -232,16 +232,6 @@ impl Identity {
                 .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
     }
 
-    pub(crate) fn is_valid(&self) -> bool {
-        match self.status.as_str() {
-            "known" => self.is_known(),
-            "unknown" => self.known_person_id.is_none() && self.display_name.is_none(),
-            "no_face" | "multiple_faces" | "not_enrolled" | "not_enabled" | "failed" => {
-                self.known_person_id.is_none() && self.display_name.is_none() && self.confidence.is_none()
-            }
-            _ => false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
