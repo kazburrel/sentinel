@@ -17,12 +17,10 @@
 //! returns an error; every failure just downgrades `ai.status` to
 //! `"failed"` and moves on.
 //!
-//! The saved `analysis.json` also carries an `identity` block that is
-//! always `"not_enabled"` today -- it exists purely so a future local
-//! known-person-recognition module can be plugged in later (matched against
-//! a face embedding, a local people database, etc.) without changing this
-//! file's shape or the event storage pipeline again. Nothing here infers,
-//! stores, or asks the model for anyone's identity.
+//! The saved `analysis.json` also carries an `identity` block populated by
+//! the separate local recognition module. Ollama is still never asked to
+//! identify anyone; this module only preserves the independently produced
+//! result beside the scene analysis.
 
 use std::fs;
 use std::io;
@@ -186,25 +184,62 @@ pub enum Importance {
     Critical,
 }
 
-/// Placeholder for a future known-person-recognition module. Deliberately
-/// inert: no face recognition, no embeddings, no people database exist yet,
-/// and the vision model is never asked to identify anyone -- `status` is
-/// always `"not_enabled"` until that future module exists and sets it.
-#[derive(Debug, Clone, Serialize)]
+/// Result from the separate local known-person recognizer. `confidence` is
+/// SFace cosine similarity in the range 0..=1 for a confirmed match, not the
+/// vision model's scene confidence percentage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Identity {
-    pub status: &'static str,
+    pub status: String,
     pub known_person_id: Option<String>,
     pub display_name: Option<String>,
     pub confidence: Option<f32>,
 }
 
 impl Identity {
-    fn not_enabled() -> Self {
+    pub(crate) fn not_enabled() -> Self {
         Identity {
-            status: "not_enabled",
+            status: "not_enabled".to_string(),
             known_person_id: None,
             display_name: None,
             confidence: None,
+        }
+    }
+
+    pub(crate) fn not_enrolled() -> Self {
+        Identity {
+            status: "not_enrolled".to_string(),
+            known_person_id: None,
+            display_name: None,
+            confidence: None,
+        }
+    }
+
+    pub(crate) fn failed() -> Self {
+        Identity {
+            status: "failed".to_string(),
+            known_person_id: None,
+            display_name: None,
+            confidence: None,
+        }
+    }
+
+    pub fn is_known(&self) -> bool {
+        self.status == "known"
+            && self.known_person_id.as_deref().is_some_and(|value| !value.trim().is_empty())
+            && self.display_name.as_deref().is_some_and(|value| !value.trim().is_empty())
+            && self
+                .confidence
+                .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        match self.status.as_str() {
+            "known" => self.is_known(),
+            "unknown" => self.known_person_id.is_none() && self.display_name.is_none(),
+            "no_face" | "multiple_faces" | "not_enrolled" | "not_enabled" | "failed" => {
+                self.known_person_id.is_none() && self.display_name.is_none() && self.confidence.is_none()
+            }
+            _ => false,
         }
     }
 }
@@ -383,11 +418,30 @@ fn parse_event_analysis(raw: &str) -> Result<EventAnalysis, AnalyzeError> {
 /// them fails to read, this transparently falls back to exactly the
 /// thumbnail-only analysis Milestone 19 already did -- there is no
 /// separate "fallback mode", just fewer images in the same request.
+#[cfg(test)]
 pub fn analyze_and_save(
     analyzer: &dyn EventAnalyzer,
     thumbnail_path: &Path,
     keyframe_paths: &[PathBuf],
     analysis_path: &Path,
+) -> AnalysisResult {
+    analyze_and_save_with_identity(
+        analyzer,
+        thumbnail_path,
+        keyframe_paths,
+        analysis_path,
+        Identity::not_enabled(),
+    )
+}
+
+/// Production entry point: preserves the independently generated local
+/// identity result whether scene analysis succeeds or fails.
+pub fn analyze_and_save_with_identity(
+    analyzer: &dyn EventAnalyzer,
+    thumbnail_path: &Path,
+    keyframe_paths: &[PathBuf],
+    analysis_path: &Path,
+    identity: Identity,
 ) -> AnalysisResult {
     let meta = |status| AiMeta {
         provider: analyzer.provider().to_string(),
@@ -401,7 +455,7 @@ pub fn analyze_and_save(
             println!("AI analysis: failed to read thumbnail {}: {e}", thumbnail_path.display());
             let result = AnalysisResult {
                 event_analysis: None,
-                identity: Identity::not_enabled(),
+                identity,
                 ai: meta(AiStatus::Failed),
             };
             if let Err(e) = save_analysis_json(analysis_path, &result) {
@@ -423,14 +477,14 @@ pub fn analyze_and_save(
     let result = match analyzer.analyze(&image_refs) {
         Ok(event_analysis) => AnalysisResult {
             event_analysis: Some(event_analysis),
-            identity: Identity::not_enabled(),
+            identity,
             ai: meta(AiStatus::Success),
         },
         Err(e) => {
             println!("AI analysis failed for {} ({} image(s)): {e:?}", thumbnail_path.display(), image_refs.len());
             AnalysisResult {
                 event_analysis: None,
-                identity: Identity::not_enabled(),
+                identity,
                 ai: meta(AiStatus::Failed),
             }
         }
@@ -612,6 +666,31 @@ mod tests {
     }
 
     #[test]
+    fn production_analysis_preserves_local_identity() {
+        let (thumb_path, analysis_path) = scratch_paths("known_identity");
+        fs::write(&thumb_path, b"fake-jpeg-bytes").unwrap();
+        let identity = Identity {
+            status: "known".to_string(),
+            known_person_id: Some("admin".to_string()),
+            display_name: Some("Admin".to_string()),
+            confidence: Some(0.82),
+        };
+        let analyzer = FakeAnalyzer {
+            result: Ok(sample_analysis()),
+        };
+
+        let result = analyze_and_save_with_identity(&analyzer, &thumb_path, &[], &analysis_path, identity);
+        assert!(result.identity.is_known());
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&analysis_path).unwrap()).unwrap();
+        assert_eq!(saved["identity"]["status"], "known");
+        assert_eq!(saved["identity"]["known_person_id"], "admin");
+        assert_eq!(saved["identity"]["display_name"], "Admin");
+
+        fs::remove_dir_all(thumb_path.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn saves_failed_shape_when_thumbnail_is_missing() {
         let (thumb_path, analysis_path) = scratch_paths("missing_thumbnail");
         // Deliberately never written -- simulates a thumbnail that
@@ -734,7 +813,7 @@ mod tests {
     fn parses_a_markdown_fenced_response() {
         let fenced = "```json\n{\"person\":false,\"package\":true,\"vehicle\":false,\"animal\":false,\"concerning_object\":false,\"concerning_behavior\":false,\"description\":\"This looks like a delivery.\",\"plain_description\":\"A package appears near the door.\",\"notable_actions\":[\"package left near door\"],\"concerning_details\":[],\"likely_intent\":\"delivery\",\"recommended_action\":\"Check the package when convenient.\",\"friday_comment\":\"\",\"importance\":\"high\",\"confidence\":92,\"reason\":[\"A package-like object is visible.\"],\"timeline\":[\"A package appears near the door.\"],\"regions\":[{\"label\":\"package\",\"kind\":\"package\",\"x\":100,\"y\":500,\"w\":300,\"h\":250,\"confidence\":88}]}\n```";
         let parsed = parse_event_analysis(fenced).expect("fenced JSON should still parse");
-        assert_eq!(parsed.package, true);
+        assert!(parsed.package);
         assert_eq!(parsed.importance, Importance::High);
         assert_eq!(parsed.confidence, 92);
         assert_eq!(parsed.likely_intent, "delivery");

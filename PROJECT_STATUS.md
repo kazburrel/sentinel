@@ -2126,6 +2126,59 @@ camera view. Tail duration remains 5 seconds, and re-arm quiet gap remains 15 se
 Firmware builds cleanly in release mode; the new duration still needs flashing to the
 ESP32 before it affects hardware behavior.
 
+## Milestone 26 — local admin facial recognition
+
+Added conservative, fully local known-person recognition without changing the proven
+PIR, recording, upload, SD queue, or Telegram timing sequence.
+
+- **Local-only YuNet + SFace pipeline**: new `scripts/face_identity.py` detects and
+  aligns faces across the thumbnail/keyframes (including 0/90/180/270-degree camera
+  orientations), generates normalized SFace embeddings, and matches those embeddings
+  against local identity profiles. The official OpenCV Zoo YuNet/SFace models and
+  their SHA-256 hashes are documented under `scripts/models/`; both are Apache-2.0.
+- **Private enrollment**: confirmed event `1784135006831` was enrolled as person ID
+  `admin`, display name `Admin`, from six usable event frames. Only embeddings are
+  stored in `server/identities/admin.json`; the profile directory is mode `0700`, the
+  profile is mode `0600`, and `server/identities/` is gitignored so biometric data is
+  never pushed. Enrollment photos are never copied into the profile.
+- **Conservative matching**: default cosine threshold is `0.50`; two matching event
+  images confirm identity, or one image must pass the stricter `0.65` threshold.
+  Weak/blurred faces remain `unknown`, missing faces become `no_face`, and any frame
+  containing multiple faces becomes `multiple_faces` so an Admin standing beside an
+  unknown visitor can never suppress the visitor alert. Any model, sidecar, or profile
+  failure fails open as an ordinary unknown-person alert rather than suppressing it.
+  Thresholds can be tuned with `FRIDAY_FACE_MATCH_THRESHOLD` and
+  `FRIDAY_FACE_STRONG_MATCH_THRESHOLD`.
+- **Server integration**: new `server/src/identity.rs` runs after keyframe extraction
+  and before Ollama scene analysis. `analysis.json` now preserves the local identity
+  result even if scene analysis fails. Ollama's prompt still explicitly forbids
+  identification; it never receives identity names or performs the match.
+- **Admin-aware notifications**: routine events confidently matched to Admin are
+  recorded, uploaded, analyzed, and retained normally but do not send a Telegram
+  alert. `concerning_object`, `concerning_behavior`, or `critical` importance always
+  overrides suppression. Threat notifications name the recognized Admin and include
+  match confidence.
+- **Real console-only replay verification**: replayed the clear knife/gesture frame
+  from confirmed admin event `1784135006831` through a release server with Telegram
+  deliberately disabled. The stored result was `identity.status=known`,
+  `known_person_id=admin`, `display_name=Admin`, confidence `1.0`; Ollama marked both
+  `concerning_object` and `concerning_behavior`; and the notification policy emitted
+  the threat alert with `Identity: Admin (100% match)`. The synthetic replay artifacts
+  were removed afterward. No development notification was sent to the real chat.
+- **Checks**: 72 server tests + 12 shared tests pass, including admin suppression,
+  threat override, identity parsing/validation, and identity persistence through AI.
+  Sixteen Python identity/tracking tests pass; Python compile and
+  `cargo clippy -p server -- -D warnings` are clean.
+
+To replace or expand the local admin profile, run from the repository root:
+
+```sh
+.venv-tracker/bin/python scripts/face_identity.py enroll \
+  --person-id admin --display-name Admin \
+  --output server/identities/admin.json \
+  /path/to/clear-admin-frame-1.jpg /path/to/clear-admin-frame-2.jpg
+```
+
 ## Next steps (not yet started)
 
 - **Actionable notifications: in progress (Milestone 24).** Telegram alerting and
@@ -2147,12 +2200,15 @@ ESP32 before it affects hardware behavior.
   smoke test that left all 137 recent real event files alone. Not yet observed
   deleting naturally aged-out real files over a real 30-day lifetime; low risk, not
   blocking anything.
+- **Local admin facial recognition: complete (Milestone 26).** New events are matched
+  locally before notification. The profile is intentionally not committed; enroll
+  additional confirmed poses locally if future live tests show weak-angle misses.
 - **AI thumbnail analysis: complete (Milestone 19).** Superseded by Milestone 22 for
   the "thumbnail only" limitation specifically -- analysis now covers video key
   frames too when present. The Ollama integration, prompt design, and
   offline/failure handling proven here still apply unchanged. Natural future
-  extensions, not started: the known-person-recognition module the `identity` block
-  was built to support, bounding boxes -- none blocking anything else.
+  extensions: additional known-person profiles and richer bounding boxes -- neither
+  blocks the current admin-recognition path.
 - **Audio part, optional, later.** `PartKind::Audio` already exists in the envelope
   (reserved, unused) -- add it only once there's an actual audio source to capture;
   the wire format and server storage path need no changes to support it when that

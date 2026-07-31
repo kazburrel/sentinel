@@ -88,6 +88,15 @@ Before a real-media release, also verify:
 - Client-provided paths cannot influence storage locations.
 - Secrets are absent from `git status`, logs, binaries intended for public sharing,
   container layers, and example configuration files.
+- `server/identities/` remains gitignored and readable only by the service account;
+  identity profiles contain biometric embeddings and must not enter source control,
+  images, logs, backups, or hosted deployments without an explicit privacy decision.
+- Both OpenCV face models exist under `scripts/models/`, their SHA-256 hashes match
+  `scripts/models/README.md`, and the configured Python environment provides the
+  pinned OpenCV version from `scripts/requirements-tracker.txt`.
+- A known-admin routine event is suppressed, while a known-admin threat event still
+  alerts. Any missing model/profile/sidecar must fail open as an unknown person, never
+  silently suppress a notification.
 
 ### Firmware gate
 
@@ -195,4 +204,3 @@ arrives:
 - TLS implementation and certificate validation on the ESP32.
 - Restricted device credential format, rotation, revocation, and rate limiting.
 - Event retention, deletion, backup, privacy, and cost limits.
-

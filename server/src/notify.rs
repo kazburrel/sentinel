@@ -21,7 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use ureq::unversioned::multipart::Form;
 
-use crate::ai::{AnalysisRegion, EventAnalysis, Importance, RegionKind};
+use crate::ai::{AnalysisRegion, EventAnalysis, Identity, Importance, RegionKind};
 use crate::video;
 
 const TELEGRAM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -57,6 +57,7 @@ impl AlertCategory {
 pub struct Alert {
     pub categories: Vec<AlertCategory>,
     pub analysis: EventAnalysis,
+    pub identity: Identity,
     pub thumbnail_path: PathBuf,
 }
 
@@ -84,6 +85,15 @@ impl Alert {
             priority_label(self.analysis.importance),
             self.analysis.confidence.min(100),
         );
+
+        if self.identity.is_known() {
+            message.push_str("\nIdentity: ");
+            message.push_str(self.identity.display_name.as_deref().unwrap_or("known person"));
+            message.push_str(&format!(
+                " ({:.0}% match)",
+                self.identity.confidence.unwrap_or_default() * 100.0
+            ));
+        }
 
         if !self.analysis.notable_actions.is_empty() {
             message.push_str("\n\nNotable:");
@@ -256,7 +266,25 @@ impl NotificationPolicy {
         policy
     }
 
+    #[cfg(test)]
     pub fn alert_for(&self, analysis: &EventAnalysis, thumbnail_path: &Path, _analysis_path: &Path) -> Option<Alert> {
+        self.alert_for_identity(analysis, &Identity::not_enabled(), thumbnail_path, _analysis_path)
+    }
+
+    pub fn alert_for_identity(
+        &self,
+        analysis: &EventAnalysis,
+        identity: &Identity,
+        thumbnail_path: &Path,
+        _analysis_path: &Path,
+    ) -> Option<Alert> {
+        let threat_override = analysis.concerning_object
+            || analysis.concerning_behavior
+            || matches!(analysis.importance, Importance::Critical);
+        if identity.is_known() && !threat_override {
+            return None;
+        }
+
         let mut categories = Vec::new();
 
         if self.notify_person && analysis.person {
@@ -284,6 +312,7 @@ impl NotificationPolicy {
         (!categories.is_empty()).then(|| Alert {
             categories,
             analysis: analysis.clone(),
+            identity: identity.clone(),
             thumbnail_path: thumbnail_path.to_path_buf(),
         })
     }
@@ -714,7 +743,7 @@ fn annotate_video_if_possible(uploads_dir: &Path, video_path: &Path) -> PathBuf 
     let Some(event_id) = event_id_for_playable_video_path(video_path) else {
         return video_path.to_path_buf();
     };
-    let Some((_, analysis)) = analysis_for_event(uploads_dir, &event_id) else {
+    let Some((_, analysis, _)) = analysis_for_event(uploads_dir, &event_id) else {
         return video_path.to_path_buf();
     };
     if let Some(locked_path) =
@@ -896,18 +925,23 @@ fn analysis_path_for_event(uploads_dir: &Path, requested_event_id: &str) -> Opti
 #[derive(Deserialize)]
 struct StoredAnalysis {
     event_analysis: Option<EventAnalysis>,
+    identity: Option<Identity>,
+}
+
+fn read_stored_analysis(path: &Path) -> Option<StoredAnalysis> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 fn read_event_analysis(path: &Path) -> Option<EventAnalysis> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let stored: StoredAnalysis = serde_json::from_str(&contents).ok()?;
-    stored.event_analysis
+    read_stored_analysis(path)?.event_analysis
 }
 
-fn analysis_for_event(uploads_dir: &Path, requested_event_id: &str) -> Option<(String, EventAnalysis)> {
+fn analysis_for_event(uploads_dir: &Path, requested_event_id: &str) -> Option<(String, EventAnalysis, Identity)> {
     let (event_id, path) = analysis_path_for_event(uploads_dir, requested_event_id)?;
-    let analysis = read_event_analysis(&path)?;
-    Some((event_id, analysis))
+    let stored = read_stored_analysis(&path)?;
+    let analysis = stored.event_analysis?;
+    Some((event_id, analysis, stored.identity.unwrap_or_else(Identity::not_enabled)))
 }
 
 fn categories_for_analysis(analysis: &EventAnalysis) -> Vec<AlertCategory> {
@@ -936,10 +970,11 @@ fn categories_for_analysis(analysis: &EventAnalysis) -> Vec<AlertCategory> {
     categories
 }
 
-fn summary_message_for_event(event_id: &str, analysis: &EventAnalysis) -> String {
+fn summary_message_for_event(event_id: &str, analysis: &EventAnalysis, identity: Identity) -> String {
     let alert = Alert {
         categories: categories_for_analysis(analysis),
         analysis: analysis.clone(),
+        identity,
         thumbnail_path: PathBuf::from(format!("event_{event_id}_thumbnail.jpg")),
     };
     alert.message()
@@ -1052,8 +1087,8 @@ fn send_video_for_event(
 
 fn send_summary_for_event(telegram: &TelegramNotifier, uploads_dir: &Path, requested_event_id: &str) {
     match analysis_for_event(uploads_dir, requested_event_id) {
-        Some((event_id, analysis)) => {
-            if let Err(e) = telegram.send_message(&summary_message_for_event(&event_id, &analysis)) {
+        Some((event_id, analysis, identity)) => {
+            if let Err(e) = telegram.send_message(&summary_message_for_event(&event_id, &analysis, identity)) {
                 println!("telegram commands: failed to send summary for event {event_id}: {e:?}");
             }
         }
@@ -1073,7 +1108,7 @@ fn send_summary_for_event(telegram: &TelegramNotifier, uploads_dir: &Path, reque
 
 fn send_analysis_for_event(telegram: &TelegramNotifier, uploads_dir: &Path, requested_event_id: &str) {
     match analysis_for_event(uploads_dir, requested_event_id) {
-        Some((event_id, analysis)) => {
+        Some((event_id, analysis, _)) => {
             let json = serde_json::to_string_pretty(&analysis).unwrap_or_else(|_| "{}".to_string());
             let message = format!("Project FRIDAY analysis for event {event_id}\n\n{json}");
             if let Err(e) = telegram.send_message(&message) {
@@ -1218,13 +1253,14 @@ pub fn maybe_notify(
     policy: &NotificationPolicy,
     notifier: &dyn Notifier,
     analysis: &EventAnalysis,
+    identity: &Identity,
     thumbnail_path: &Path,
     analysis_path: &Path,
 ) {
-    let Some(alert) = policy.alert_for(analysis, thumbnail_path, analysis_path) else {
+    let Some(alert) = policy.alert_for_identity(analysis, identity, thumbnail_path, analysis_path) else {
         println!(
-            "notification: skipped non-actionable event (person={}, package={}, vehicle={}, animal={}, importance={:?})",
-            analysis.person, analysis.package, analysis.vehicle, analysis.animal, analysis.importance
+            "notification: skipped event (identity={}, person={}, package={}, vehicle={}, animal={}, importance={:?})",
+            identity.status, analysis.person, analysis.package, analysis.vehicle, analysis.animal, analysis.importance
         );
         return;
     };
@@ -1287,6 +1323,15 @@ mod tests {
         }
     }
 
+    fn known_admin() -> Identity {
+        Identity {
+            status: "known".to_string(),
+            known_person_id: Some("admin".to_string()),
+            display_name: Some("Admin".to_string()),
+            confidence: Some(0.82),
+        }
+    }
+
     #[test]
     fn default_policy_notifies_for_person_package_or_high_importance() {
         let policy = NotificationPolicy::default();
@@ -1306,6 +1351,35 @@ mod tests {
 
         assert!(policy.alert_for(&analysis(false, false, false, false, Importance::Low), thumb, out).is_none());
         assert!(policy.alert_for(&analysis(false, false, false, false, Importance::Medium), thumb, out).is_none());
+    }
+
+    #[test]
+    fn known_admin_suppresses_a_routine_person_alert() {
+        let policy = NotificationPolicy::default();
+        let alert = policy.alert_for_identity(
+            &analysis(true, false, false, false, Importance::High),
+            &known_admin(),
+            Path::new("event_1_thumbnail.jpg"),
+            Path::new("event_1_analysis.json"),
+        );
+        assert!(alert.is_none());
+    }
+
+    #[test]
+    fn threat_signal_overrides_known_admin_suppression() {
+        let policy = NotificationPolicy::default();
+        let mut event = analysis(true, false, false, false, Importance::High);
+        event.concerning_object = true;
+        let alert = policy
+            .alert_for_identity(
+                &event,
+                &known_admin(),
+                Path::new("event_1_thumbnail.jpg"),
+                Path::new("event_1_analysis.json"),
+            )
+            .expect("a threat must notify even when the person is known");
+        assert!(alert.categories.contains(&AlertCategory::SecurityConcern));
+        assert!(alert.message().contains("Identity: Admin (82% match)"));
     }
 
     #[test]
@@ -1414,6 +1488,7 @@ mod tests {
         let alert = Alert {
             categories: vec![AlertCategory::Visitor, AlertCategory::HighImportance],
             analysis,
+            identity: Identity::not_enabled(),
             thumbnail_path: PathBuf::from("/tmp/event_1783953798101_alert.jpg"),
         };
         let full_message = alert.message();

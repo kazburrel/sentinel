@@ -29,6 +29,7 @@
 
 mod ai;
 mod config;
+mod identity;
 mod notify;
 mod retention;
 mod video;
@@ -548,11 +549,13 @@ fn process_request(
                     keyframes
                 })
                 .unwrap_or_default();
-            let result = ai::analyze_and_save(
+            let identity = identity::recognize_event(Path::new(&thumbnail_path), &keyframe_paths);
+            let result = ai::analyze_and_save_with_identity(
                 analyzer.as_ref(),
                 Path::new(&thumbnail_path),
                 &keyframe_paths,
                 Path::new(&analysis_path),
+                identity,
             );
             if let Some(event_analysis) = result.event_analysis.as_ref() {
                 let alert_thumbnail_path = video::select_alert_thumbnail(Path::new(&thumbnail_path), &keyframe_paths);
@@ -565,6 +568,7 @@ fn process_request(
                     &notification_policy,
                     notifier.as_ref(),
                     event_analysis,
+                    &result.identity,
                     notification_thumbnail_path,
                     Path::new(&analysis_path),
                 );
@@ -591,6 +595,7 @@ fn handle_connection(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::io::Cursor;

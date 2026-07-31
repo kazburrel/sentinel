@@ -825,10 +825,10 @@ mod tests {
         assert_eq!(fs::read(&video_path).unwrap(), raw);
 
         assert_eq!(written.len(), 3);
-        for i in 0..3 {
+        for (i, written_path) in written.iter().enumerate() {
             let keyframe = dir.join(format!("event_123_keyframe_{i}.jpg"));
             assert!(keyframe.exists(), "expected {keyframe:?} to exist");
-            assert_eq!(written[i], keyframe, "returned paths should match what was written, in order");
+            assert_eq!(written_path, &keyframe, "returned paths should match what was written, in order");
         }
         assert_eq!(fs::read(dir.join("event_123_keyframe_1.jpg")).unwrap(), b"frame-one");
 
