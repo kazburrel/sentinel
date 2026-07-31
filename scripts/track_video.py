@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +45,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", default=0.25, type=float, help="Detection confidence threshold")
     parser.add_argument("--face-model", default=str(DEFAULT_FACE_MODEL), help="OpenCV YuNet face detector ONNX path")
     parser.add_argument("--face-conf", default=0.45, type=float, help="Face detector confidence threshold")
+    parser.add_argument(
+        "--body-smoothing",
+        default=0.30,
+        type=float,
+        help="EMA weight for new body positions. Lower is steadier; higher follows motion faster.",
+    )
+    parser.add_argument(
+        "--face-smoothing",
+        default=0.22,
+        type=float,
+        help="EMA weight for face position relative to its tracked body.",
+    )
+    parser.add_argument(
+        "--track-hold-frames",
+        default=5,
+        type=int,
+        help="Frames to predict/hold a body or face through a brief missed detection.",
+    )
     parser.add_argument(
         "--threat-level",
         default="normal",
@@ -81,6 +101,303 @@ def kind_for_name(name: str) -> str | None:
     if normalized in ANIMALS:
         return "animal"
     return None
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def box_center_size(det: dict[str, Any]) -> tuple[float, float, float, float]:
+    width = max(1.0, float(det["x2"]) - float(det["x1"]))
+    height = max(1.0, float(det["y2"]) - float(det["y1"]))
+    return (
+        float(det["x1"]) + width / 2.0,
+        float(det["y1"]) + height / 2.0,
+        width,
+        height,
+    )
+
+
+def raw_box(det: dict[str, Any]) -> dict[str, int]:
+    return {name: int(det[name]) for name in ("x1", "y1", "x2", "y2")}
+
+
+def set_box(
+    det: dict[str, Any],
+    cx: float,
+    cy: float,
+    box_width: float,
+    box_height: float,
+    frame_width: int,
+    frame_height: int,
+) -> None:
+    half_width = max(1.0, box_width) / 2.0
+    half_height = max(1.0, box_height) / 2.0
+    x1 = int(round(clamp(cx - half_width, 0, frame_width - 2)))
+    y1 = int(round(clamp(cy - half_height, 0, frame_height - 2)))
+    x2 = int(round(clamp(cx + half_width, x1 + 1, frame_width - 1)))
+    y2 = int(round(clamp(cy + half_height, y1 + 1, frame_height - 1)))
+    det.update({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+
+@dataclass
+class BodyTrackState:
+    template: dict[str, Any]
+    cx: float
+    cy: float
+    width: float
+    height: float
+    velocity_x: float = 0.0
+    velocity_y: float = 0.0
+    missed: int = 0
+
+
+class BodyBoxStabilizer:
+    """Smooth tracked YOLO person boxes and bridge short detector dropouts.
+
+    ByteTrack supplies identity, but its box coordinates still come directly from
+    YOLO on every frame. Rendering those raw coordinates is what made the visible
+    lock shake even while the track ID remained stable. This layer keeps a small
+    amount of temporal state per ID, smooths center/size independently, limits a
+    single-frame center jump, and predicts for a few missing frames.
+    """
+
+    def __init__(self, smoothing: float, hold_frames: int) -> None:
+        self.smoothing = clamp(smoothing, 0.05, 1.0)
+        self.size_smoothing = clamp(smoothing * 0.65, 0.05, 1.0)
+        self.hold_frames = max(0, hold_frames)
+        self.states: dict[int, BodyTrackState] = {}
+
+    def update(
+        self,
+        detections: list[dict[str, Any]],
+        frame_width: int,
+        frame_height: int,
+    ) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        seen: set[int] = set()
+
+        for detection in detections:
+            track_id = detection.get("track_id")
+            if track_id is None:
+                passthrough = detection.copy()
+                passthrough["raw_box"] = raw_box(detection)
+                passthrough["stabilized"] = False
+                passthrough["held"] = False
+                output.append(passthrough)
+                continue
+
+            track_id = int(track_id)
+            seen.add(track_id)
+            measured_cx, measured_cy, measured_width, measured_height = box_center_size(detection)
+            state = self.states.get(track_id)
+            if state is None:
+                state = BodyTrackState(
+                    template=detection.copy(),
+                    cx=measured_cx,
+                    cy=measured_cy,
+                    width=measured_width,
+                    height=measured_height,
+                )
+                self.states[track_id] = state
+            else:
+                delta_x = measured_cx - state.cx
+                delta_y = measured_cy - state.cy
+                distance = math.hypot(delta_x, delta_y)
+                max_step = max(18.0, max(state.width, state.height) * 0.45)
+                if distance > max_step:
+                    scale = max_step / distance
+                    delta_x *= scale
+                    delta_y *= scale
+
+                previous_cx, previous_cy = state.cx, state.cy
+                state.cx += self.smoothing * delta_x
+                state.cy += self.smoothing * delta_y
+                state.width += self.size_smoothing * (measured_width - state.width)
+                state.height += self.size_smoothing * (measured_height - state.height)
+                state.velocity_x = state.velocity_x * 0.65 + (state.cx - previous_cx) * 0.35
+                state.velocity_y = state.velocity_y * 0.65 + (state.cy - previous_cy) * 0.35
+                state.template = detection.copy()
+                state.missed = 0
+
+            rendered = detection.copy()
+            rendered["raw_box"] = raw_box(detection)
+            rendered["stabilized"] = True
+            rendered["held"] = False
+            set_box(rendered, state.cx, state.cy, state.width, state.height, frame_width, frame_height)
+            output.append(rendered)
+
+        active_boxes = list(output)
+        for track_id, state in list(self.states.items()):
+            if track_id in seen:
+                continue
+            state.missed += 1
+            if state.missed > self.hold_frames:
+                del self.states[track_id]
+                continue
+
+            state.cx += state.velocity_x * 0.65
+            state.cy += state.velocity_y * 0.65
+            state.velocity_x *= 0.70
+            state.velocity_y *= 0.70
+            held = state.template.copy()
+            held["raw_box"] = None
+            held["stabilized"] = True
+            held["held"] = True
+            held["confidence"] = round(float(held.get("confidence", 0.0)) * (0.88 ** state.missed), 4)
+            held["source"] = "temporal_body_hold"
+            set_box(held, state.cx, state.cy, state.width, state.height, frame_width, frame_height)
+
+            # ByteTrack can occasionally assign a new ID after a dropout. Do not
+            # draw the held old ID over a live replacement occupying the same body.
+            if any(box_iou(held, active) > 0.35 for active in active_boxes):
+                continue
+            output.append(held)
+
+        return output
+
+
+@dataclass
+class FaceTrackState:
+    template: dict[str, Any]
+    relative_cx: float
+    relative_cy: float
+    relative_width: float
+    relative_height: float
+    missed: int = 0
+
+
+class FaceBoxStabilizer:
+    """Stabilize a face in body-relative coordinates for the same track ID.
+
+    Keeping the face relative to its smoothed person box prevents the head lock
+    from lagging behind when the whole person moves. It also lets a face survive a
+    short YuNet miss while continuing to follow the body instead of freezing in
+    screen coordinates.
+    """
+
+    def __init__(self, smoothing: float, hold_frames: int) -> None:
+        self.smoothing = clamp(smoothing, 0.05, 1.0)
+        self.size_smoothing = clamp(smoothing * 0.70, 0.05, 1.0)
+        self.hold_frames = max(0, hold_frames)
+        self.states: dict[int, FaceTrackState] = {}
+
+    @staticmethod
+    def relative_box(face: dict[str, Any], person: dict[str, Any]) -> tuple[float, float, float, float]:
+        face_cx, face_cy, face_width, face_height = box_center_size(face)
+        person_cx, person_cy, person_width, person_height = box_center_size(person)
+        person_x1 = person_cx - person_width / 2.0
+        person_y1 = person_cy - person_height / 2.0
+        return (
+            (face_cx - person_x1) / person_width,
+            (face_cy - person_y1) / person_height,
+            face_width / person_width,
+            face_height / person_height,
+        )
+
+    @staticmethod
+    def absolute_box(
+        relative_cx: float,
+        relative_cy: float,
+        relative_width: float,
+        relative_height: float,
+        person: dict[str, Any],
+    ) -> tuple[float, float, float, float]:
+        person_cx, person_cy, person_width, person_height = box_center_size(person)
+        person_x1 = person_cx - person_width / 2.0
+        person_y1 = person_cy - person_height / 2.0
+        return (
+            person_x1 + relative_cx * person_width,
+            person_y1 + relative_cy * person_height,
+            relative_width * person_width,
+            relative_height * person_height,
+        )
+
+    def update(
+        self,
+        detections: list[dict[str, Any]],
+        people: list[dict[str, Any]],
+        frame_width: int,
+        frame_height: int,
+    ) -> list[dict[str, Any]]:
+        people_by_track = {
+            int(person["track_id"]): person
+            for person in people
+            if person.get("track_id") is not None
+        }
+        output: list[dict[str, Any]] = []
+        seen: set[int] = set()
+
+        for detection in detections:
+            track_id = detection.get("track_id")
+            person = people_by_track.get(int(track_id)) if track_id is not None else None
+            if track_id is None or person is None:
+                passthrough = detection.copy()
+                passthrough["raw_box"] = raw_box(detection)
+                passthrough["stabilized"] = False
+                passthrough["held"] = False
+                output.append(passthrough)
+                continue
+
+            track_id = int(track_id)
+            seen.add(track_id)
+            measured = self.relative_box(detection, person)
+            state = self.states.get(track_id)
+            if state is None:
+                state = FaceTrackState(detection.copy(), *measured)
+                self.states[track_id] = state
+            else:
+                # Relative head movement should be small. Clamp a single YuNet
+                # jump so one marginal detection cannot throw the lock across the body.
+                delta_x = clamp(measured[0] - state.relative_cx, -0.12, 0.12)
+                delta_y = clamp(measured[1] - state.relative_cy, -0.12, 0.12)
+                state.relative_cx += self.smoothing * delta_x
+                state.relative_cy += self.smoothing * delta_y
+                state.relative_width += self.size_smoothing * (measured[2] - state.relative_width)
+                state.relative_height += self.size_smoothing * (measured[3] - state.relative_height)
+                state.template = detection.copy()
+                state.missed = 0
+
+            rendered = detection.copy()
+            rendered["raw_box"] = raw_box(detection)
+            rendered["stabilized"] = True
+            rendered["held"] = False
+            absolute = self.absolute_box(
+                state.relative_cx,
+                state.relative_cy,
+                state.relative_width,
+                state.relative_height,
+                person,
+            )
+            set_box(rendered, *absolute, frame_width, frame_height)
+            output.append(rendered)
+
+        for track_id, state in list(self.states.items()):
+            if track_id in seen:
+                continue
+            state.missed += 1
+            person = people_by_track.get(track_id)
+            if state.missed > self.hold_frames or person is None:
+                del self.states[track_id]
+                continue
+
+            held = state.template.copy()
+            held["raw_box"] = None
+            held["stabilized"] = True
+            held["held"] = True
+            held["confidence"] = round(float(held.get("confidence", 0.0)) * (0.86 ** state.missed), 4)
+            held["source"] = "temporal_face_hold"
+            absolute = self.absolute_box(
+                state.relative_cx,
+                state.relative_cy,
+                state.relative_width,
+                state.relative_height,
+                person,
+            )
+            set_box(held, *absolute, frame_width, frame_height)
+            output.append(held)
+
+        return output
 
 
 class ThreatLatch:
@@ -226,6 +543,29 @@ def contains_center(outer: dict[str, Any], inner: dict[str, Any]) -> bool:
     return outer["x1"] <= cx <= outer["x2"] and outer["y1"] <= cy <= outer["y2"]
 
 
+def plausible_face_for_person(person: dict[str, Any], face: dict[str, Any]) -> bool:
+    """Reject rotation-induced YuNet false positives before they enter a track.
+
+    Running YuNet over four rotations is useful for the physically rotated camera,
+    but it can occasionally call a shoulder/torso-sized patch a face. A real face
+    lock must be contained near the upper part of its person and remain reasonably
+    small relative to that body box.
+    """
+
+    if not contains_center(person, face):
+        return False
+    _, face_cy, face_width, face_height = box_center_size(face)
+    _, _, person_width, person_height = box_center_size(person)
+    relative_center_y = (face_cy - float(person["y1"])) / person_height
+    relative_area = (face_width * face_height) / (person_width * person_height)
+    return (
+        face_width / person_width <= 0.70
+        and face_height / person_height <= 0.45
+        and relative_area <= 0.25
+        and relative_center_y <= 0.55
+    )
+
+
 def status_text_for(frame_level: str) -> str:
     return {
         "normal": "FRIDAY LOCK",
@@ -288,13 +628,16 @@ class FaceDetector:
             if any(box_iou(face, existing) > 0.10 for existing in kept):
                 continue
             for person in person_detections:
-                if contains_center(person, face):
+                if plausible_face_for_person(person, face):
                     face["track_id"] = person.get("track_id")
                     break
-            if face["track_id"] is not None and face["track_id"] in used_person_tracks:
+            # Unassociated faces have no stable identity and were a major source
+            # of one-frame boxes. Only render a face that belongs to a body track.
+            if face["track_id"] is None:
                 continue
-            if face["track_id"] is not None:
-                used_person_tracks.add(face["track_id"])
+            if face["track_id"] in used_person_tracks:
+                continue
+            used_person_tracks.add(face["track_id"])
             kept.append(face)
             if len(kept) >= 3:
                 break
@@ -371,9 +714,12 @@ def main() -> int:
     face_detector = FaceDetector(Path(args.face_model), args.face_conf)
     names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
     threat_latch = ThreatLatch(args.threat_hold_frames, args.threat_level, args.concerning_behavior)
+    body_stabilizer = BodyBoxStabilizer(args.body_smoothing, args.track_hold_frames)
+    face_stabilizer = FaceBoxStabilizer(args.face_smoothing, args.track_hold_frames)
     frames: list[dict[str, Any]] = []
     frame_count = 0
     detection_count = 0
+    held_detection_count = 0
 
     results = model.track(
         source=str(args.input),
@@ -386,8 +732,8 @@ def main() -> int:
 
     for frame_index, result in enumerate(results):
         frame = result.orig_img.copy()
-        detections: list[dict[str, Any]] = []
-        person_detections: list[dict[str, Any]] = []
+        other_detections: list[dict[str, Any]] = []
+        raw_person_detections: list[dict[str, Any]] = []
         boxes = result.boxes
         if boxes is not None:
             for i, box in enumerate(boxes):
@@ -419,11 +765,15 @@ def main() -> int:
                     "y2": y2,
                     "source": "yolo_bytetrack",
                 }
-                detections.append(det)
                 if kind == "person":
-                    person_detections.append(det)
+                    raw_person_detections.append(det)
+                else:
+                    other_detections.append(det)
 
-        detections.extend(face_detector.detect(frame, person_detections))
+        person_detections = body_stabilizer.update(raw_person_detections, width, height)
+        raw_face_detections = face_detector.detect(frame, person_detections)
+        face_detections = face_stabilizer.update(raw_face_detections, person_detections, width, height)
+        detections = other_detections + person_detections + face_detections
 
         rendered_threat_level = threat_latch.update(detections)
         for det in detections:
@@ -450,6 +800,7 @@ def main() -> int:
             }
         )
         detection_count += len(detections)
+        held_detection_count += sum(bool(det.get("held")) for det in detections)
         frame_count += 1
 
     writer.release()
@@ -460,14 +811,18 @@ def main() -> int:
         "model": args.model,
         "tracker": args.tracker,
         "event_threat_level": args.threat_level,
-        "render_policy": "stateful-threat-latch-v3",
+        "render_policy": "temporally-stabilized-lock-v4",
         "threat_hold_frames": args.threat_hold_frames,
+        "body_smoothing": args.body_smoothing,
+        "face_smoothing": args.face_smoothing,
+        "track_hold_frames": args.track_hold_frames,
         "concerning_behavior": args.concerning_behavior,
         "fps": fps,
         "width": width,
         "height": height,
         "frame_count": frame_count,
         "detection_count": detection_count,
+        "held_detection_count": held_detection_count,
         "frames": frames,
     }
     tmp_tracks.write_text(json.dumps(tracks, indent=2), encoding="utf-8")

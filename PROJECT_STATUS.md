@@ -2039,6 +2039,28 @@ firmware is untouched.
   locked videos are not reused. Re-generated `1784135006831`: 292/301 frames rendered
   normal/white, 9/301 rendered threat/red, with the first frame visually confirmed
   white and the object frame confirmed red.
+- **Stable body/face locks added after live wobble review**: ByteTrack IDs alone did
+  not make the rendered lock stable because raw YOLO coordinates were still drawn
+  independently on every frame, while YuNet redetected faces independently on every
+  frame. `scripts/track_video.py` now keeps temporal body state per ByteTrack ID,
+  smooths body center and size, limits implausible one-frame jumps, predicts through
+  five-frame detector gaps, and suppresses a held old ID when ByteTrack replaces it
+  with an overlapping live ID. Face boxes are now smoothed in coordinates relative
+  to their stabilized body, so a briefly held face follows its person instead of
+  freezing or lagging in screen space. Raw coordinates remain in each detection's
+  `raw_box` for comparison/debugging, with `held` and `stabilized` flags. Four-rotation
+  YuNet false positives are filtered by body-relative size and upper-body position;
+  unassociated one-frame face boxes are no longer rendered. Defaults are tunable
+  without code changes through `FRIDAY_BODY_SMOOTHING`,
+  `FRIDAY_FACE_SMOOTHING`, and `FRIDAY_TRACK_HOLD_FRAMES`. Cache outputs were bumped
+  to `*_locked_stable_<level>.mp4` / `*_tracks_stable_<level>.json`, while Telegram's
+  event parser keeps accepting every older locked filename. On real 301-frame event
+  `1784135006831`, high-frequency coordinate movement fell 63.0% for the body and
+  68.2% for the face; visual contact-sheet review also caught and removed a prior
+  torso-sized false face box. The run produced 291 live + 5 held person detections
+  and 199 live + 48 held face detections. Seven focused Python tests cover smoothing,
+  short holds, ID replacement, body-relative face following, false-face filtering,
+  and threat-latch independence.
 - **Clear-human Telegram alert photo added**: Telegram no longer has to use the first
   PIR trigger thumbnail or a fixed later keyframe. Added `scripts/select_alert_frame.py`,
   a lightweight YuNet face-selector sidecar that scans the extracted keyframes (with
@@ -2060,7 +2082,7 @@ firmware is untouched.
   ESP32, produced keyframes and `analysis.json`, and the server logged
   `notification(telegram): sent`. The model result had `person: true`, `importance:
   medium`, so it correctly notified under the actionable-event rule.
-- **Tests/checks**: server now has 63 tests passing (policy, alert formatting, strict
+- **Tests/checks**: server now has 65 tests passing (policy, alert formatting, strict
   `video` command parsing/resend parsing, callback-data parsing, security concern
   notification, command help/list parsing, recent-event listing, and safe video-path
   resolution).

@@ -673,7 +673,10 @@ fn event_id_for_playable_video_path(path: &Path) -> Option<String> {
         .or_else(|| rest.strip_suffix("_locked_frame_threat.mp4"))
         .or_else(|| rest.strip_suffix("_locked_latched_normal.mp4"))
         .or_else(|| rest.strip_suffix("_locked_latched_minimal.mp4"))
-        .or_else(|| rest.strip_suffix("_locked_latched_threat.mp4"))?;
+        .or_else(|| rest.strip_suffix("_locked_latched_threat.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_stable_normal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_stable_minimal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_stable_threat.mp4"))?;
     (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string())
 }
 
@@ -1598,5 +1601,21 @@ mod tests {
         assert_eq!(playable_video_path_for_event(&dir, "123"), Some(mp4));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolves_event_id_from_stable_and_older_locked_videos() {
+        assert_eq!(
+            event_id_for_playable_video_path(Path::new("event_123_locked_stable_threat.mp4")),
+            Some("123".to_string())
+        );
+        assert_eq!(
+            event_id_for_playable_video_path(Path::new("event_123_locked_latched_threat.mp4")),
+            Some("123".to_string())
+        );
+        assert_eq!(
+            event_id_for_playable_video_path(Path::new("event_not-numeric_locked_stable_normal.mp4")),
+            None
+        );
     }
 }

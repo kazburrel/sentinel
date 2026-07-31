@@ -265,8 +265,8 @@ pub fn convert_to_mp4(video_path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Runs the optional YOLO/ByteTrack sidecar to create a real frame-level
-/// locked video (`event_<id>_locked.mp4`) plus `event_<id>_tracks.json`.
+/// Runs the optional YOLO/ByteTrack sidecar to create a real frame-level,
+/// temporally stabilized locked video plus its tracks JSON sidecar.
 /// If Python, Ultralytics, OpenCV, the model, or tracking fails, this logs
 /// the reason and returns `None`; callers can then fall back to the plain
 /// MP4 or the older static-HUD overlay. The source MP4 is never modified.
@@ -290,6 +290,12 @@ pub fn lock_mp4_with_tracker(
     let model = std::env::var("FRIDAY_YOLO_MODEL").unwrap_or_else(|_| "yolo11m.pt".to_string());
     let tracker = std::env::var("FRIDAY_YOLO_TRACKER").unwrap_or_else(|_| "bytetrack.yaml".to_string());
     let conf = std::env::var("FRIDAY_YOLO_CONF").unwrap_or_else(|_| "0.08".to_string());
+    let body_smoothing =
+        std::env::var("FRIDAY_BODY_SMOOTHING").unwrap_or_else(|_| "0.30".to_string());
+    let face_smoothing =
+        std::env::var("FRIDAY_FACE_SMOOTHING").unwrap_or_else(|_| "0.22".to_string());
+    let track_hold_frames =
+        std::env::var("FRIDAY_TRACK_HOLD_FRAMES").unwrap_or_else(|_| "5".to_string());
 
     let mut command = Command::new(&python);
     command
@@ -306,6 +312,12 @@ pub fn lock_mp4_with_tracker(
         .arg(&tracker)
         .arg("--conf")
         .arg(&conf)
+        .arg("--body-smoothing")
+        .arg(&body_smoothing)
+        .arg("--face-smoothing")
+        .arg(&face_smoothing)
+        .arg("--track-hold-frames")
+        .arg(&track_hold_frames)
         .arg("--threat-level")
         .arg(threat_level.as_str());
     // Passed independently of `threat_level`: `tracker_threat_level` (in
@@ -515,7 +527,7 @@ fn annotated_output_path(input_path: &Path) -> Option<PathBuf> {
 fn locked_output_path(input_path: &Path, threat_level: Option<TrackerThreatLevel>) -> Option<PathBuf> {
     let name = input_path.file_name()?.to_str()?;
     let suffix = threat_level
-        .map(|level| format!("_locked_latched_{}", level.as_str()))
+        .map(|level| format!("_locked_stable_{}", level.as_str()))
         .unwrap_or_else(|| "_locked_frame".to_string());
     let annotated = if let Some(stem) = name.strip_suffix("_video.mp4") {
         format!("{stem}{suffix}.mp4")
@@ -530,7 +542,7 @@ fn locked_output_path(input_path: &Path, threat_level: Option<TrackerThreatLevel
 fn tracks_output_path(input_path: &Path, threat_level: Option<TrackerThreatLevel>) -> Option<PathBuf> {
     let name = input_path.file_name()?.to_str()?;
     let suffix = threat_level
-        .map(|level| format!("_tracks_latched_{}", level.as_str()))
+        .map(|level| format!("_tracks_stable_{}", level.as_str()))
         .unwrap_or_else(|| "_tracks_frame".to_string());
     let tracks = if let Some(stem) = name.strip_suffix("_video.mp4") {
         format!("{stem}{suffix}.json")
@@ -844,5 +856,19 @@ mod tests {
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "only the untouched original file should remain");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stable_tracker_outputs_use_a_fresh_cache_name() {
+        let input = Path::new("/tmp/event_123_video.mp4");
+
+        assert_eq!(
+            locked_output_path(input, Some(TrackerThreatLevel::Normal)),
+            Some(PathBuf::from("/tmp/event_123_locked_stable_normal.mp4"))
+        );
+        assert_eq!(
+            tracks_output_path(input, Some(TrackerThreatLevel::Threat)),
+            Some(PathBuf::from("/tmp/event_123_tracks_stable_threat.json"))
+        );
     }
 }
