@@ -555,10 +555,11 @@ fn process_request(
                 Path::new(&analysis_path),
             );
             if let Some(event_analysis) = result.event_analysis.as_ref() {
-                let notification_thumbnail_path = keyframe_paths
-                    .get(1)
-                    .or_else(|| keyframe_paths.first())
-                    .map(PathBuf::as_path)
+                let alert_thumbnail_path = video::select_alert_thumbnail(Path::new(&thumbnail_path), &keyframe_paths);
+                let notification_thumbnail_path = alert_thumbnail_path
+                    .as_deref()
+                    .or_else(|| keyframe_paths.get(1).map(PathBuf::as_path))
+                    .or_else(|| keyframe_paths.first().map(PathBuf::as_path))
                     .unwrap_or_else(|| Path::new(&thumbnail_path));
                 notify::maybe_notify(
                     &notification_policy,

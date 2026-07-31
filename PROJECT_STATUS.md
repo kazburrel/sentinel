@@ -1942,10 +1942,112 @@ firmware is untouched.
   details. Telegram alerts now prefer `plain_description` and can show notable
   actions, concerns, likely intent, and recommended action, so the user sees the raw
   practical readout instead of only booleans plus a softened one-line summary.
+- **Private FRIDAY comment added for nuisance/threat events**: the AI schema/prompt
+  now includes `friday_comment`, an optional one-sentence Telegram-only personality
+  line. Normal/low-risk events should leave it empty. Hostile gestures, tampering,
+  threats, or concerning objects can get a short witty FRIDAY-style roast such as a
+  "camera keeps receipts" comment. The prompt explicitly keeps it safe: no slurs, no
+  protected-trait insults, no body shaming, no sexual comments, no violent threats,
+  and no instructions to harm anyone. Telegram alerts show it as `FRIDAY says: ...`
+  when present. If the model marks an event as concerning but forgets to fill the
+  comment, the server adds a small safe fallback line so nuisance/threat alerts still
+  get the FRIDAY personality treatment. Old `analysis.json` files remain compatible
+  because the new field defaults to an empty string.
+- **Telegram long-caption failure fixed after event `1784135006831`**: that event
+  uploaded and processed correctly (301 frames / about 25 seconds, AI success, MP4 and
+  locked threat MP4 generated), but Telegram rejected the initial `sendPhoto` with HTTP
+  400 because the AI-generated alert caption had grown too long for a photo caption.
+  The notifier now uses a shorter photo caption with the Send video button attached,
+  and sends the full FRIDAY analysis as a separate text message when the full alert is
+  too long. This keeps the photo/button path from failing while preserving the longer
+  explanation.
 - **Telegram video resend guard added**: after FRIDAY successfully sends a video for
   an event, tapping the button or requesting that same event again will not keep
   re-sending the clip. FRIDAY replies that it was already sent; an explicit
   `video <event_id> again` or `video latest again` forces another copy.
+- **Telegram command help/control added**: the command listener now responds to
+  `help`, `/start`, and `commands` with the supported command list, plus `events`
+  for the last 5 analyzed events, `summary latest`, `photo latest`, `analysis latest`,
+  `video latest`, and `resend latest`. The same commands also accept explicit numeric
+  event IDs where useful, e.g. `photo 1783957936278` or `analysis 1783957936278`.
+  This makes Telegram a small FRIDAY control panel instead of only an alert sink.
+- **Annotated video overlay path added**: when Telegram sends a video and a successful
+  AI analysis exists for that event, the server now prefers a generated
+  `event_<id>_annotated.mp4` over the plain `event_<id>_video.mp4`. The annotation is
+  burned into the video with ffmpeg as a first-pass Project-FRIDAY/Person-of-Interest
+  style HUD: outer frame, face/person-region block, and colored labels derived from
+  the AI result. Red is used for concerning object/behavior, yellow for high-attention
+  actions, green for packages, and white for ordinary person/vehicle/animal labels.
+  After the first live overlay test, the ffmpeg filter was fixed so annotated output
+  is actually generated instead of falling back to the plain video.
+- **AI region boxes added for lock-on style overlays**: the AI prompt/schema now asks
+  for `regions` -- approximate normalized boxes for face/head, person, package,
+  knife/sharp object, gesture, door, or other important objects. `server/src/video.rs`
+  can burn those regions into the MP4, and `server/src/notify.rs` maps face/person,
+  package, knife/object, and gesture regions to the FRIDAY overlay colors. Existing
+  old events without regions still fall back to broad preset boxes, and old
+  `analysis.json` shapes are now tolerated so older videos can still receive a
+  visible overlay instead of silently falling back to plain video. The generated file
+  name changed to `event_<id>_locked.mp4` so stale earlier annotated files are not
+  reused. This AI-region path is still not full per-frame tracking; it is event-level
+  lock boxes from AI-provided coordinates, kept as a fallback behind the real tracker
+  sidecar described next.
+- **Real YOLO/ByteTrack sidecar added for actual locked boxes**: after Fable's
+  research confirmed that Qwen/ffmpeg prompting cannot produce true lock-on boxes,
+  added `scripts/track_video.py` plus `scripts/requirements-tracker.txt`. The Rust
+  server now tries this sidecar first when Telegram sends a video: it runs local
+  Ultralytics YOLO tracking (`yolo11m.pt` by default, ByteTrack, low confidence),
+  writes `event_<id>_tracks.json`, and renders `event_<id>_locked.mp4` with per-frame
+  boxes burned in. `.venv-tracker/` is gitignored and the server auto-uses
+  `.venv-tracker/bin/python` when present. Verified on the old knife event
+  `1783956503532`: the initial YOLO-only pass generated 108 frames / 211 detections,
+  with white person lock and a red object/knife-like lock on the blade area (YOLO
+  labelled the blade-like object as `scissors` in one frame, but the red box is on the
+  concerning object). The older ffmpeg/AI-region overlay remains as fallback if the
+  tracker sidecar or dependencies fail.
+- **Face/head lock fixed after live review**: the first tracker pass derived
+  `FACE/HEAD` from the top of the YOLO person box, which failed badly with the
+  sideways camera angle (the face box could sit over the torso/arm). The tracker
+  sidecar now uses OpenCV YuNet (`scripts/models/face_detection_yunet_2023mar.onnx`,
+  kept local/gitignored) and runs face detection across 0/90/180/270-degree rotated
+  frame views, mapping detections back to the original 640x480 frame. The face box now
+  appears only when the face is actually detected and disappears when it leaves/fails
+  detection. Re-verified on knife event `1783956503532`: the regenerated locked video
+  produced 108 frames / 242 detections, with YuNet face detections in 93/108 frames,
+  plus the red blade/object lock.
+- **Threat-level color policy added**: tracker rendering now accepts an event-level
+  `--threat-level normal|minimal|threat`, and the Rust server derives that from
+  `analysis.json` when calling the sidecar. Normal events keep person/face boxes
+  white. Concerning behavior without a weapon/object (e.g. hostile/obscene gesture)
+  becomes `minimal` and colors person/face yellow with `FRIDAY LOCK - MINIMAL THREAT`.
+  Concerning object or `critical` events become `threat` and color person/face red
+  with `FRIDAY LOCK - THREAT`; knife/object boxes remain red. Cached outputs are
+  separated by filename (`*_locked_normal.mp4`, `*_locked_minimal.mp4`,
+  `*_locked_threat.mp4`) so a previous color state is not reused. Re-generated the
+  middle-finger event `1783957936278` as minimal/yellow and the knife event
+  `1783956503532` as threat/red; face duplicate boxes were reduced by assigning only
+  one YuNet face box per tracked person.
+- **Frame-aware threat coloring added after live review**: event `1784135006831`
+  revealed that the prior event-level `threat` color made the video start with red
+  face/person boxes even before any concerning object appeared. `scripts/track_video.py`
+  now computes a `rendered_threat_level` per frame: normal/white when no threat object
+  is visible, red only on frames where YOLO detects a concerning object (`knife`,
+  `scissors`, `baseball bat`, etc.), and yellow remains the event-level fallback for
+  gesture-only/minimal-threat events because there is not yet a reliable local
+  frame-by-frame gesture detector. Tracker output filenames were bumped to
+  `*_locked_frame_<level>.mp4` / `*_tracks_frame_<level>.json` so old cached all-red
+  locked videos are not reused. Re-generated `1784135006831`: 292/301 frames rendered
+  normal/white, 9/301 rendered threat/red, with the first frame visually confirmed
+  white and the object frame confirmed red.
+- **Clear-human Telegram alert photo added**: Telegram no longer has to use the first
+  PIR trigger thumbnail or a fixed later keyframe. Added `scripts/select_alert_frame.py`,
+  a lightweight YuNet face-selector sidecar that scans the extracted keyframes (with
+  0/90/180/270-degree rotated face detection for the sideways camera view), chooses the
+  frame with the best visible face/head, and writes `event_<id>_alert.jpg`. The server
+  now tries that file for the initial Telegram `sendPhoto`, falling back to keyframe 1,
+  keyframe 0, then the original thumbnail if no face is found or the sidecar fails.
+  Verified on knife event `1783956503532`: selected `keyframe_1` and produced a clear
+  human alert image with face/object visible.
 - **Alert thumbnail improved**: the stored event thumbnail is still the first capture
   at trigger time, but Telegram notifications now use a later extracted keyframe when
   available (keyframe 1, falling back to keyframe 0, then the original thumbnail).
@@ -1958,9 +2060,10 @@ firmware is untouched.
   ESP32, produced keyframes and `analysis.json`, and the server logged
   `notification(telegram): sent`. The model result had `person: true`, `importance:
   medium`, so it correctly notified under the actionable-event rule.
-- **Tests/checks**: server now has 58 tests passing (policy, alert formatting, strict
+- **Tests/checks**: server now has 63 tests passing (policy, alert formatting, strict
   `video` command parsing/resend parsing, callback-data parsing, security concern
-  notification, and safe video-path resolution).
+  notification, command help/list parsing, recent-event listing, and safe video-path
+  resolution).
   `cargo clippy -p server -- -D warnings` passes. `cargo fmt -p server` could not run
   on this Mac because `rustfmt` is not installed for the active stable toolchain.
 

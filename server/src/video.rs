@@ -31,6 +31,63 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// is ever needed, that's a different, heavier feature than this one.
 const MAX_KEYFRAMES: usize = 6;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayColor {
+    White,
+    Yellow,
+    Red,
+    Green,
+}
+
+impl OverlayColor {
+    fn ffmpeg(self) -> &'static str {
+        match self {
+            OverlayColor::White => "white",
+            OverlayColor::Yellow => "yellow",
+            OverlayColor::Red => "red",
+            OverlayColor::Green => "lime",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayLabel {
+    pub text: String,
+    pub color: OverlayColor,
+}
+
+impl OverlayLabel {
+    pub fn new(text: impl Into<String>, color: OverlayColor) -> Self {
+        Self {
+            text: text.into(),
+            color,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayRegion {
+    pub label: String,
+    pub color: OverlayColor,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl OverlayRegion {
+    pub fn new(label: impl Into<String>, color: OverlayColor, x: u16, y: u16, w: u16, h: u16) -> Self {
+        Self {
+            label: label.into(),
+            color,
+            x,
+            y,
+            w,
+            h,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum VideoError {
     Empty,
@@ -206,6 +263,398 @@ pub fn convert_to_mp4(video_path: &Path) -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Runs the optional YOLO/ByteTrack sidecar to create a real frame-level
+/// locked video (`event_<id>_locked.mp4`) plus `event_<id>_tracks.json`.
+/// If Python, Ultralytics, OpenCV, the model, or tracking fails, this logs
+/// the reason and returns `None`; callers can then fall back to the plain
+/// MP4 or the older static-HUD overlay. The source MP4 is never modified.
+pub fn lock_mp4_with_tracker(
+    input_path: &Path,
+    threat_level: TrackerThreatLevel,
+    concerning_behavior: bool,
+) -> Option<PathBuf> {
+    let output_path = locked_output_path(input_path, Some(threat_level))?;
+    if output_path.is_file() {
+        return Some(output_path);
+    }
+    let tracks_path = tracks_output_path(input_path, Some(threat_level))?;
+    let script_path = tracker_script_path();
+    if !script_path.is_file() {
+        println!("video: tracker sidecar not found at {}", script_path.display());
+        return None;
+    }
+
+    let python = tracker_python();
+    let model = std::env::var("FRIDAY_YOLO_MODEL").unwrap_or_else(|_| "yolo11m.pt".to_string());
+    let tracker = std::env::var("FRIDAY_YOLO_TRACKER").unwrap_or_else(|_| "bytetrack.yaml".to_string());
+    let conf = std::env::var("FRIDAY_YOLO_CONF").unwrap_or_else(|_| "0.08".to_string());
+
+    let mut command = Command::new(&python);
+    command
+        .arg(&script_path)
+        .arg("--input")
+        .arg(input_path)
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--tracks")
+        .arg(&tracks_path)
+        .arg("--model")
+        .arg(&model)
+        .arg("--tracker")
+        .arg(&tracker)
+        .arg("--conf")
+        .arg(&conf)
+        .arg("--threat-level")
+        .arg(threat_level.as_str());
+    // Passed independently of `threat_level`: `tracker_threat_level` (in
+    // `notify.rs`) collapses concerning_object/concerning_behavior/importance
+    // into one 3-way level, which loses whether concerning_behavior is *also*
+    // true for a "threat" (concerning_object) event -- and that's exactly what
+    // decides whether person/face downgrades to yellow or white once the
+    // threat-hold window expires (see the tracker script's `ThreatLatch`).
+    if concerning_behavior {
+        command.arg("--concerning-behavior");
+    }
+    let output = command.output().map_err(|e| format!("start tracker sidecar: {e}"));
+
+    match output {
+        Ok(output) if output.status.success() && output_path.is_file() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !stdout.trim().is_empty() {
+                println!("video: tracker sidecar: {}", stdout.trim());
+            }
+            Some(output_path)
+        }
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!(
+                "video: tracker sidecar failed for {} with {}: {}{}{}",
+                input_path.display(),
+                output.status,
+                stdout.trim(),
+                if stdout.trim().is_empty() || stderr.trim().is_empty() {
+                    ""
+                } else {
+                    " -- "
+                },
+                stderr.trim()
+            );
+            let _ = fs::remove_file(&output_path);
+            let _ = fs::remove_file(&tracks_path);
+            None
+        }
+        Err(e) => {
+            println!("video: tracker sidecar failed for {}: {e}", input_path.display());
+            None
+        }
+    }
+}
+
+/// Creates `event_<id>_alert.jpg` from the clearest human keyframe using
+/// the lightweight YuNet face selector sidecar. This is used for Telegram
+/// alert photos so the first notification shows a recognizable human frame
+/// instead of the PIR trigger frame where the person may only be half in view.
+/// Returns `None` on any sidecar/dependency/no-face failure so callers can
+/// fall back to the normal keyframe/thumbnail choice.
+pub fn select_alert_thumbnail(thumbnail_path: &Path, keyframe_paths: &[PathBuf]) -> Option<PathBuf> {
+    let output_path = alert_output_path(thumbnail_path)?;
+    if output_path.is_file() {
+        return Some(output_path);
+    }
+    let script_path = alert_selector_script_path();
+    if !script_path.is_file() {
+        println!("video: alert-frame sidecar not found at {}", script_path.display());
+        return None;
+    }
+
+    let mut images: Vec<&Path> = keyframe_paths.iter().map(PathBuf::as_path).collect();
+    images.push(thumbnail_path);
+    let python = tracker_python();
+    let output = Command::new(&python)
+        .arg(&script_path)
+        .arg("--output")
+        .arg(&output_path)
+        .args(&images)
+        .output()
+        .map_err(|e| format!("start alert-frame sidecar: {e}"));
+
+    match output {
+        Ok(output) if output.status.success() && output_path.is_file() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !stdout.trim().is_empty() {
+                println!("video: alert-frame sidecar: {}", stdout.trim());
+            }
+            Some(output_path)
+        }
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!(
+                "video: alert-frame sidecar failed for {} with {}: {}{}{}",
+                thumbnail_path.display(),
+                output.status,
+                stdout.trim(),
+                if stdout.trim().is_empty() || stderr.trim().is_empty() {
+                    ""
+                } else {
+                    " -- "
+                },
+                stderr.trim()
+            );
+            let _ = fs::remove_file(&output_path);
+            None
+        }
+        Err(e) => {
+            println!("video: alert-frame sidecar failed for {}: {e}", thumbnail_path.display());
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerThreatLevel {
+    Normal,
+    Minimal,
+    Threat,
+}
+
+impl TrackerThreatLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrackerThreatLevel::Normal => "normal",
+            TrackerThreatLevel::Minimal => "minimal",
+            TrackerThreatLevel::Threat => "threat",
+        }
+    }
+}
+
+/// Burns a simple FRIDAY/Person-of-Interest-style HUD into an already
+/// playable MP4. This is intentionally a server-side viewing feature: the
+/// original raw `.bin` and plain `.mp4` are kept unchanged, and failures
+/// fall back to the normal video path. The labels come from the event AI
+/// analysis; this does not yet perform true per-frame object tracking or
+/// exact bounding-box detection.
+pub fn annotate_mp4(input_path: &Path, labels: &[OverlayLabel], regions: &[OverlayRegion]) -> Option<PathBuf> {
+    if labels.is_empty() && regions.is_empty() {
+        return Some(input_path.to_path_buf());
+    }
+
+    let output_path = annotated_output_path(input_path)?;
+    if output_path.is_file() {
+        return Some(output_path);
+    }
+
+    let filter = overlay_filter(labels, regions);
+    let Some(file_name) = output_path.file_name().and_then(|s| s.to_str()) else {
+        println!("video: invalid annotated output file name: {}", output_path.display());
+        return None;
+    };
+    let tmp_output = output_path.with_file_name(format!(".{file_name}.tmp.mp4"));
+
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(input_path)
+        .arg("-vf")
+        .arg(&filter)
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-an")
+        .arg(&tmp_output)
+        .output()
+        .map_err(|e| format!("start ffmpeg: {e}"));
+
+    match output {
+        Ok(output) if output.status.success() => match fs::rename(&tmp_output, &output_path) {
+            Ok(()) => {
+                println!(
+                    "video: created annotated video {} from {}",
+                    output_path.display(),
+                    input_path.display()
+                );
+                Some(output_path)
+            }
+            Err(e) => {
+                println!(
+                    "video: failed to rename annotated temp output {} -> {}: {e}",
+                    tmp_output.display(),
+                    output_path.display()
+                );
+                let _ = fs::remove_file(&tmp_output);
+                None
+            }
+        },
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("video: annotated mp4 failed for {}: {}", input_path.display(), stderr);
+            let _ = fs::remove_file(&tmp_output);
+            None
+        }
+        Err(e) => {
+            println!("video: annotated mp4 failed for {}: {e}", input_path.display());
+            let _ = fs::remove_file(&tmp_output);
+            None
+        }
+    }
+}
+
+fn annotated_output_path(input_path: &Path) -> Option<PathBuf> {
+    locked_output_path(input_path, None)
+}
+
+fn locked_output_path(input_path: &Path, threat_level: Option<TrackerThreatLevel>) -> Option<PathBuf> {
+    let name = input_path.file_name()?.to_str()?;
+    let suffix = threat_level
+        .map(|level| format!("_locked_latched_{}", level.as_str()))
+        .unwrap_or_else(|| "_locked_frame".to_string());
+    let annotated = if let Some(stem) = name.strip_suffix("_video.mp4") {
+        format!("{stem}{suffix}.mp4")
+    } else if let Some(stem) = name.strip_suffix(".mp4") {
+        format!("{stem}{suffix}.mp4")
+    } else {
+        return None;
+    };
+    Some(input_path.with_file_name(annotated))
+}
+
+fn tracks_output_path(input_path: &Path, threat_level: Option<TrackerThreatLevel>) -> Option<PathBuf> {
+    let name = input_path.file_name()?.to_str()?;
+    let suffix = threat_level
+        .map(|level| format!("_tracks_latched_{}", level.as_str()))
+        .unwrap_or_else(|| "_tracks_frame".to_string());
+    let tracks = if let Some(stem) = name.strip_suffix("_video.mp4") {
+        format!("{stem}{suffix}.json")
+    } else if let Some(stem) = name.strip_suffix(".mp4") {
+        format!("{stem}{suffix}.json")
+    } else {
+        return None;
+    };
+    Some(input_path.with_file_name(tracks))
+}
+
+fn alert_output_path(thumbnail_path: &Path) -> Option<PathBuf> {
+    let name = thumbnail_path.file_name()?.to_str()?;
+    let stem = name.strip_suffix("_thumbnail.jpg")?;
+    Some(thumbnail_path.with_file_name(format!("{stem}_alert.jpg")))
+}
+
+fn tracker_script_path() -> PathBuf {
+    if let Ok(path) = std::env::var("FRIDAY_TRACKER_SCRIPT") {
+        return PathBuf::from(path);
+    }
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .unwrap_or(manifest_dir)
+        .join("scripts")
+        .join("track_video.py")
+}
+
+fn alert_selector_script_path() -> PathBuf {
+    if let Ok(path) = std::env::var("FRIDAY_ALERT_FRAME_SCRIPT") {
+        return PathBuf::from(path);
+    }
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .unwrap_or(manifest_dir)
+        .join("scripts")
+        .join("select_alert_frame.py")
+}
+
+fn tracker_python() -> String {
+    if let Ok(path) = std::env::var("FRIDAY_TRACKER_PYTHON") {
+        return path;
+    }
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap_or(manifest_dir);
+    let venv_python = repo_root.join(".venv-tracker").join("bin").join("python");
+    if venv_python.is_file() {
+        venv_python.to_string_lossy().into_owned()
+    } else {
+        "python3".to_string()
+    }
+}
+
+fn overlay_filter(labels: &[OverlayLabel], regions: &[OverlayRegion]) -> String {
+    let primary = labels
+        .iter()
+        .find(|label| label.color == OverlayColor::Red)
+        .or_else(|| labels.iter().find(|label| label.color == OverlayColor::Yellow))
+        .or_else(|| labels.first())
+        .map(|label| label.color)
+        .unwrap_or(OverlayColor::White);
+    let primary_color = primary.ffmpeg();
+
+    let mut filters = vec![
+        format!("drawbox=x=12:y=12:w=iw-24:h=ih-24:color={primary_color}@0.85:t=4"),
+        "drawtext=text='FRIDAY VISION':x=24:y=24:fontsize=22:fontcolor=cyan:box=1:boxcolor=black@0.60:boxborderw=8".to_string(),
+    ];
+
+    if regions.is_empty() {
+        filters.push(format!("drawbox=x=305:y=20:w=300:h=365:color={primary_color}@0.75:t=4"));
+        filters.push(format!("drawbox=x=365:y=48:w=220:h=175:color={primary_color}@0.95:t=6"));
+        filters.push(format!("drawtext=text='PERSON REGION':x=305:y=226:fontsize=18:fontcolor={primary_color}:box=1:boxcolor=black@0.65:boxborderw=6"));
+        filters.push(format!("drawtext=text='FACE / HEAD':x=365:y=20:fontsize=18:fontcolor={primary_color}:box=1:boxcolor=black@0.65:boxborderw=6"));
+    } else {
+        for region in regions.iter().take(8) {
+            let (x, y, w, h) = normalized_region_to_640x480(region);
+            let color = region.color.ffmpeg();
+            let label_y = y.saturating_sub(28);
+            filters.push(format!("drawbox=x={x}:y={y}:w={w}:h={h}:color={color}@0.95:t=5"));
+            filters.push(format!(
+                "drawtext=text='{}':x={x}:y={label_y}:fontsize=18:fontcolor={color}:box=1:boxcolor=black@0.70:boxborderw=6",
+                escape_drawtext(&region.label.to_ascii_uppercase())
+            ));
+        }
+    }
+
+    for (i, label) in labels.iter().take(6).enumerate() {
+        let y = 64 + i * 32;
+        filters.push(format!(
+            "drawtext=text='{}':x=24:y={y}:fontsize=20:fontcolor={}:box=1:boxcolor=black@0.55:boxborderw=7",
+            escape_drawtext(&label.text),
+            label.color.ffmpeg()
+        ));
+    }
+
+    filters.join(",")
+}
+
+fn normalized_region_to_640x480(region: &OverlayRegion) -> (u16, u16, u16, u16) {
+    let x = region.x.min(999) as u32 * 640 / 1000;
+    let y = region.y.min(999) as u32 * 480 / 1000;
+    let max_w = 640u32.saturating_sub(x).max(1);
+    let max_h = 480u32.saturating_sub(y).max(1);
+    let min_w = 12.min(max_w);
+    let min_h = 12.min(max_h);
+    let w = (region.w.clamp(20, 1000) as u32 * 640 / 1000).clamp(min_w, max_w);
+    let h = (region.h.clamp(20, 1000) as u32 * 480 / 1000).clamp(min_h, max_h);
+    (x as u16, y as u16, w as u16, h as u16)
+}
+
+fn escape_drawtext(text: &str) -> String {
+    text.chars()
+        .flat_map(|ch| match ch {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '\'' => "\\'".chars().collect::<Vec<_>>(),
+            ':' => "\\:".chars().collect::<Vec<_>>(),
+            ',' => "\\,".chars().collect::<Vec<_>>(),
+            '[' => "\\[".chars().collect::<Vec<_>>(),
+            ']' => "\\]".chars().collect::<Vec<_>>(),
+            _ => vec![ch],
+        })
+        .collect()
 }
 
 fn average_fps(frames: &[Frame<'_>]) -> Option<f64> {

@@ -5,3 +5,7 @@ server/src/config.rs
 server/.env*
 server/uploads/
 server/event_dedup.log
+.venv-tracker/
+scripts/__pycache__/
+yolo*.pt
+scripts/models/*.onnx

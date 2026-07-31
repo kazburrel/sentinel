@@ -21,11 +21,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use ureq::unversioned::multipart::Form;
 
-use crate::ai::{EventAnalysis, Importance};
+use crate::ai::{AnalysisRegion, EventAnalysis, Importance, RegionKind};
 use crate::video;
 
 const TELEGRAM_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 20;
+const TELEGRAM_PHOTO_CAPTION_SOFT_LIMIT: usize = 900;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertCategory {
@@ -110,6 +111,11 @@ impl Alert {
             message.push_str(&self.analysis.recommended_action);
         }
 
+        if let Some(comment) = friday_comment_for(&self.analysis) {
+            message.push_str("\n\nFRIDAY says: ");
+            message.push_str(comment);
+        }
+
         if !self.analysis.reason.is_empty() {
             message.push_str("\n\nReason:");
             for reason in self.analysis.reason.iter().take(4) {
@@ -126,7 +132,7 @@ impl Alert {
             }
         }
 
-        message.push_str("\n\nTap Send video below, or reply: video latest");
+        message.push_str("\n\nTap Send video below, or reply: video latest, events, or help");
         message
     }
 }
@@ -138,6 +144,81 @@ fn priority_label(importance: Importance) -> &'static str {
         Importance::High => "High",
         Importance::Critical => "Critical",
     }
+}
+
+fn friday_comment_for(analysis: &EventAnalysis) -> Option<&str> {
+    let model_comment = analysis.friday_comment.trim();
+    if !model_comment.is_empty() {
+        return Some(model_comment);
+    }
+
+    if analysis.concerning_object || matches!(analysis.importance, Importance::Critical) {
+        Some("That prop choice is not helping their case.")
+    } else if analysis.concerning_behavior {
+        Some("Bold choice, considering the camera keeps receipts.")
+    } else {
+        None
+    }
+}
+
+fn photo_caption_for_alert(alert: &Alert, full_message: &str) -> String {
+    if full_message.chars().count() <= TELEGRAM_PHOTO_CAPTION_SOFT_LIMIT {
+        return full_message.to_string();
+    }
+
+    let categories = alert
+        .categories
+        .iter()
+        .map(|c| c.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let event = alert.event_id().unwrap_or_else(|| "unknown".to_string());
+    let summary = if alert.analysis.plain_description.trim().is_empty() {
+        alert.analysis.description.as_str()
+    } else {
+        alert.analysis.plain_description.as_str()
+    };
+
+    let mut caption = format!(
+        "🚪 Project FRIDAY\nEvent #{event}\n\n{}\n\nPriority: {}\nConfidence: {}%\nDetected: {categories}",
+        trim_for_caption(summary, 260),
+        priority_label(alert.analysis.importance),
+        alert.analysis.confidence.min(100),
+    );
+
+    if let Some(comment) = friday_comment_for(&alert.analysis) {
+        caption.push_str("\n\nFRIDAY says: ");
+        caption.push_str(&trim_for_caption(comment, 120));
+    }
+
+    caption.push_str(
+        "\n\nFull details sent below.\nTap Send video below, or reply: video latest, events, or help",
+    );
+
+    if caption.chars().count() > TELEGRAM_PHOTO_CAPTION_SOFT_LIMIT {
+        format!(
+            "🚪 Project FRIDAY\nEvent #{event}\n\n{}\n\nPriority: {}\nConfidence: {}%\n\nFull details sent below.\nTap Send video below, or reply: video latest",
+            trim_for_caption(summary, 180),
+            priority_label(alert.analysis.importance),
+            alert.analysis.confidence.min(100),
+        )
+    } else {
+        caption
+    }
+}
+
+fn trim_for_caption(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let mut out = trimmed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +396,23 @@ impl TelegramNotifier {
             .map_err(|e| NotifyError::Request(e.to_string()))
     }
 
+    fn send_photo(&self, path: &Path, caption: &str) -> Result<(), NotifyError> {
+        let url = format!("https://api.telegram.org/bot{}/sendPhoto", self.bot_token);
+        let form = Form::new()
+            .text("chat_id", &self.chat_id)
+            .text("caption", caption)
+            .file("photo", path)
+            .map_err(|e| NotifyError::Request(e.to_string()))?;
+
+        ureq::post(url.as_str())
+            .config()
+            .timeout_global(Some(self.timeout))
+            .build()
+            .send(form)
+            .map(|_| ())
+            .map_err(|e| NotifyError::Request(e.to_string()))
+    }
+
     fn get_updates(&self, offset: Option<i64>) -> Result<Vec<TelegramUpdate>, NotifyError> {
         let mut url = format!(
             "https://api.telegram.org/bot{}/getUpdates?timeout={TELEGRAM_POLL_TIMEOUT_SECS}",
@@ -342,7 +440,8 @@ impl TelegramNotifier {
 
 impl Notifier for TelegramNotifier {
     fn notify(&self, alert: &Alert) -> Result<(), NotifyError> {
-        let caption = alert.message();
+        let full_message = alert.message();
+        let caption = photo_caption_for_alert(alert, &full_message);
         let url = format!("https://api.telegram.org/bot{}/sendPhoto", self.bot_token);
         let reply_markup = alert.event_id().map(send_video_reply_markup);
 
@@ -361,10 +460,15 @@ impl Notifier for TelegramNotifier {
             .build()
             .send(form)
         {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if caption != full_message {
+                    self.send_message(&full_message)?;
+                }
+                Ok(())
+            }
             Err(photo_err) => {
                 println!("notification(telegram): sendPhoto failed, falling back to text: {photo_err}");
-                self.send_message(&caption)
+                self.send_message(&full_message)
             }
         }
     }
@@ -431,6 +535,65 @@ struct VideoCommand {
     force_resend: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TelegramCommand {
+    Help,
+    Events,
+    Summary(String),
+    Photo(String),
+    Analysis(String),
+    Video(VideoCommand),
+}
+
+fn parse_telegram_command(text: &str) -> Option<TelegramCommand> {
+    let trimmed = text.trim();
+    let normalized = trimmed.trim_start_matches('/').trim();
+    if normalized.eq_ignore_ascii_case("help")
+        || normalized.eq_ignore_ascii_case("start")
+        || normalized.eq_ignore_ascii_case("commands")
+    {
+        return Some(TelegramCommand::Help);
+    }
+    if normalized.eq_ignore_ascii_case("events") {
+        return Some(TelegramCommand::Events);
+    }
+    if normalized.eq_ignore_ascii_case("resend latest") || normalized.eq_ignore_ascii_case("resend last") {
+        return Some(TelegramCommand::Video(VideoCommand {
+            event_id: "latest".to_string(),
+            force_resend: true,
+        }));
+    }
+    parse_event_lookup_command(normalized).or_else(|| parse_video_command(normalized).map(TelegramCommand::Video))
+}
+
+fn parse_event_lookup_command(text: &str) -> Option<TelegramCommand> {
+    let mut parts = text.split_whitespace();
+    let command = parts.next()?;
+    let event_id = parts.next().unwrap_or("latest");
+    if parts.next().is_some() {
+        return None;
+    }
+    let event_id = normalize_event_id_arg(event_id)?;
+
+    if command.eq_ignore_ascii_case("summary") {
+        Some(TelegramCommand::Summary(event_id))
+    } else if command.eq_ignore_ascii_case("photo") || command.eq_ignore_ascii_case("snapshot") {
+        Some(TelegramCommand::Photo(event_id))
+    } else if command.eq_ignore_ascii_case("analysis") {
+        Some(TelegramCommand::Analysis(event_id))
+    } else {
+        None
+    }
+}
+
+fn normalize_event_id_arg(event_id: &str) -> Option<String> {
+    let event_id = event_id.trim();
+    if event_id.eq_ignore_ascii_case("latest") || event_id.eq_ignore_ascii_case("last") {
+        return Some("latest".to_string());
+    }
+    (!event_id.is_empty() && event_id.bytes().all(|b| b.is_ascii_digit())).then(|| event_id.to_string())
+}
+
 fn parse_video_command(text: &str) -> Option<VideoCommand> {
     let mut parts = text.split_whitespace();
     let command = parts.next()?;
@@ -446,14 +609,8 @@ fn parse_video_command(text: &str) -> Option<VideoCommand> {
     if parts.next().is_some() {
         return None;
     }
-    let event_id = event_id.trim();
-    if event_id.eq_ignore_ascii_case("latest") || event_id.eq_ignore_ascii_case("last") {
-        return Some(VideoCommand {
-            event_id: "latest".to_string(),
-            force_resend,
-        });
-    }
-    (!event_id.is_empty() && event_id.bytes().all(|b| b.is_ascii_digit())).then(|| VideoCommand {
+    let event_id = normalize_event_id_arg(event_id)?;
+    Some(VideoCommand {
         event_id: event_id.to_string(),
         force_resend,
     })
@@ -477,18 +634,21 @@ fn send_video_reply_markup(event_id: String) -> String {
 }
 
 fn playable_video_path_for_event(uploads_dir: &Path, event_id: &str) -> Option<PathBuf> {
-    if event_id.eq_ignore_ascii_case("latest") || event_id.eq_ignore_ascii_case("last") {
-        return latest_playable_video_path(uploads_dir);
-    }
-    if event_id.is_empty() || !event_id.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let mp4 = uploads_dir.join(format!("event_{event_id}_video.mp4"));
-    if mp4.is_file() {
-        return Some(mp4);
-    }
-    let raw = uploads_dir.join(format!("event_{event_id}_video.bin"));
-    raw.is_file().then(|| video::convert_to_mp4(&raw)).flatten()
+    let path = if event_id.eq_ignore_ascii_case("latest") || event_id.eq_ignore_ascii_case("last") {
+        latest_playable_video_path(uploads_dir)?
+    } else {
+        if event_id.is_empty() || !event_id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mp4 = uploads_dir.join(format!("event_{event_id}_video.mp4"));
+        if mp4.is_file() {
+            mp4
+        } else {
+            let raw = uploads_dir.join(format!("event_{event_id}_video.bin"));
+            raw.is_file().then(|| video::convert_to_mp4(&raw)).flatten()?
+        }
+    };
+    Some(annotate_video_if_possible(uploads_dir, &path))
 }
 
 fn event_id_for_raw_video_path(path: &Path) -> Option<String> {
@@ -501,7 +661,19 @@ fn event_id_for_raw_video_path(path: &Path) -> Option<String> {
 fn event_id_for_playable_video_path(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     let rest = name.strip_prefix("event_")?;
-    let id = rest.strip_suffix("_video.mp4")?;
+    let id = rest
+        .strip_suffix("_video.mp4")
+        .or_else(|| rest.strip_suffix("_annotated.mp4"))
+        .or_else(|| rest.strip_suffix("_locked.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_normal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_minimal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_threat.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_frame_normal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_frame_minimal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_frame_threat.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_latched_normal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_latched_minimal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_latched_threat.mp4"))?;
     (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string())
 }
 
@@ -532,6 +704,301 @@ fn latest_playable_video_path(uploads_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+fn annotate_video_if_possible(uploads_dir: &Path, video_path: &Path) -> PathBuf {
+    let Some(event_id) = event_id_for_playable_video_path(video_path) else {
+        return video_path.to_path_buf();
+    };
+    let Some((_, analysis)) = analysis_for_event(uploads_dir, &event_id) else {
+        return video_path.to_path_buf();
+    };
+    if let Some(locked_path) =
+        video::lock_mp4_with_tracker(video_path, tracker_threat_level(&analysis), analysis.concerning_behavior)
+    {
+        return locked_path;
+    }
+    let labels = overlay_labels_for_analysis(&analysis);
+    let regions = overlay_regions_for_analysis(&analysis);
+    video::annotate_mp4(video_path, &labels, &regions).unwrap_or_else(|| video_path.to_path_buf())
+}
+
+fn tracker_threat_level(analysis: &EventAnalysis) -> video::TrackerThreatLevel {
+    if analysis.concerning_object || matches!(analysis.importance, Importance::Critical) {
+        return video::TrackerThreatLevel::Threat;
+    }
+    if analysis.concerning_behavior || matches!(analysis.importance, Importance::High) {
+        return video::TrackerThreatLevel::Minimal;
+    }
+    video::TrackerThreatLevel::Normal
+}
+
+fn overlay_labels_for_analysis(analysis: &EventAnalysis) -> Vec<video::OverlayLabel> {
+    let mut labels = Vec::new();
+    if analysis.concerning_object {
+        labels.push(video::OverlayLabel::new("CONCERNING OBJECT", video::OverlayColor::Red));
+    }
+    if analysis.concerning_behavior {
+        labels.push(video::OverlayLabel::new("CONCERNING BEHAVIOR", video::OverlayColor::Red));
+    }
+    if analysis.person {
+        let color = if analysis.concerning_object || analysis.concerning_behavior {
+            video::OverlayColor::Red
+        } else if matches!(analysis.importance, Importance::High | Importance::Critical) {
+            video::OverlayColor::Yellow
+        } else {
+            video::OverlayColor::White
+        };
+        labels.push(video::OverlayLabel::new("PERSON / FACE REGION", color));
+    }
+    if analysis.package {
+        labels.push(video::OverlayLabel::new("PACKAGE", video::OverlayColor::Green));
+    }
+    if analysis.vehicle {
+        labels.push(video::OverlayLabel::new("VEHICLE", video::OverlayColor::White));
+    }
+    if analysis.animal {
+        labels.push(video::OverlayLabel::new("ANIMAL", video::OverlayColor::White));
+    }
+    for action in analysis.notable_actions.iter().take(2) {
+        labels.push(video::OverlayLabel::new(action.to_ascii_uppercase(), video::OverlayColor::Yellow));
+    }
+    for detail in analysis.concerning_details.iter().take(2) {
+        labels.push(video::OverlayLabel::new(detail.to_ascii_uppercase(), video::OverlayColor::Red));
+    }
+    if labels.is_empty() {
+        labels.push(video::OverlayLabel::new("MOTION EVENT", video::OverlayColor::White));
+    }
+    labels
+}
+
+fn overlay_regions_for_analysis(analysis: &EventAnalysis) -> Vec<video::OverlayRegion> {
+    let mut regions: Vec<video::OverlayRegion> = analysis
+        .regions
+        .iter()
+        .filter(|region| region.w >= 20 && region.h >= 20)
+        .take(8)
+        .map(|region| {
+            video::OverlayRegion::new(
+                region_label(region),
+                region_color(analysis, region.kind),
+                region.x.min(1000),
+                region.y.min(1000),
+                region.w.min(1000),
+                region.h.min(1000),
+            )
+        })
+        .collect();
+
+    if regions.is_empty() && (analysis.concerning_object || analysis.concerning_behavior) {
+        regions.push(video::OverlayRegion::new(
+            "FACE / HEAD",
+            video::OverlayColor::Red,
+            570,
+            100,
+            320,
+            360,
+        ));
+        regions.push(video::OverlayRegion::new(
+            "CONCERNING OBJECT",
+            video::OverlayColor::Red,
+            360,
+            80,
+            280,
+            300,
+        ));
+    }
+
+    regions
+}
+
+fn region_label(region: &AnalysisRegion) -> String {
+    if region.label.trim().is_empty() {
+        match region.kind {
+            RegionKind::Person => "PERSON".to_string(),
+            RegionKind::Face => "FACE / HEAD".to_string(),
+            RegionKind::Package => "PACKAGE".to_string(),
+            RegionKind::Knife => "KNIFE / SHARP OBJECT".to_string(),
+            RegionKind::Object => "OBJECT".to_string(),
+            RegionKind::Gesture => "GESTURE".to_string(),
+            RegionKind::Door => "DOOR".to_string(),
+            RegionKind::Unknown => "REGION".to_string(),
+        }
+    } else {
+        region.label.clone()
+    }
+}
+
+fn region_color(analysis: &EventAnalysis, kind: RegionKind) -> video::OverlayColor {
+    match kind {
+        RegionKind::Knife => video::OverlayColor::Red,
+        RegionKind::Object | RegionKind::Gesture if analysis.concerning_object || analysis.concerning_behavior => {
+            video::OverlayColor::Red
+        }
+        RegionKind::Package => video::OverlayColor::Green,
+        RegionKind::Person | RegionKind::Face if matches!(analysis.importance, Importance::High | Importance::Critical) => {
+            video::OverlayColor::Yellow
+        }
+        _ => video::OverlayColor::White,
+    }
+}
+
+fn event_id_for_analysis_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix("event_")?;
+    let id = rest.strip_suffix("_analysis.json")?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string())
+}
+
+fn analysis_paths_newest_first(uploads_dir: &Path) -> Vec<(std::time::SystemTime, String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(uploads_dir) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(event_id) = event_id_for_analysis_path(&path) else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        events.push((modified, event_id, path));
+    }
+    events.sort_by_key(|event| std::cmp::Reverse(event.0));
+    events
+}
+
+fn resolve_event_id_for_analysis(uploads_dir: &Path, requested_event_id: &str) -> Option<String> {
+    if requested_event_id.eq_ignore_ascii_case("latest") || requested_event_id.eq_ignore_ascii_case("last") {
+        return analysis_paths_newest_first(uploads_dir)
+            .into_iter()
+            .next()
+            .map(|(_, event_id, _)| event_id);
+    }
+    (!requested_event_id.is_empty() && requested_event_id.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| requested_event_id.to_string())
+}
+
+fn analysis_path_for_event(uploads_dir: &Path, requested_event_id: &str) -> Option<(String, PathBuf)> {
+    let event_id = resolve_event_id_for_analysis(uploads_dir, requested_event_id)?;
+    let path = uploads_dir.join(format!("event_{event_id}_analysis.json"));
+    path.is_file().then_some((event_id, path))
+}
+
+#[derive(Deserialize)]
+struct StoredAnalysis {
+    event_analysis: Option<EventAnalysis>,
+}
+
+fn read_event_analysis(path: &Path) -> Option<EventAnalysis> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let stored: StoredAnalysis = serde_json::from_str(&contents).ok()?;
+    stored.event_analysis
+}
+
+fn analysis_for_event(uploads_dir: &Path, requested_event_id: &str) -> Option<(String, EventAnalysis)> {
+    let (event_id, path) = analysis_path_for_event(uploads_dir, requested_event_id)?;
+    let analysis = read_event_analysis(&path)?;
+    Some((event_id, analysis))
+}
+
+fn categories_for_analysis(analysis: &EventAnalysis) -> Vec<AlertCategory> {
+    let mut categories = Vec::new();
+    if analysis.person {
+        categories.push(AlertCategory::Visitor);
+    }
+    if analysis.package {
+        categories.push(AlertCategory::Package);
+    }
+    if analysis.concerning_object || analysis.concerning_behavior {
+        categories.push(AlertCategory::SecurityConcern);
+    }
+    if matches!(analysis.importance, Importance::High | Importance::Critical) {
+        categories.push(AlertCategory::HighImportance);
+    }
+    if analysis.vehicle {
+        categories.push(AlertCategory::Vehicle);
+    }
+    if analysis.animal {
+        categories.push(AlertCategory::Animal);
+    }
+    if categories.is_empty() {
+        categories.push(AlertCategory::OtherMotion);
+    }
+    categories
+}
+
+fn summary_message_for_event(event_id: &str, analysis: &EventAnalysis) -> String {
+    let alert = Alert {
+        categories: categories_for_analysis(analysis),
+        analysis: analysis.clone(),
+        thumbnail_path: PathBuf::from(format!("event_{event_id}_thumbnail.jpg")),
+    };
+    alert.message()
+}
+
+fn events_list_message(uploads_dir: &Path) -> String {
+    let events = analysis_paths_newest_first(uploads_dir);
+    if events.is_empty() {
+        return "No analyzed FRIDAY events found yet.".to_string();
+    }
+
+    let mut message = String::from("🚪 Project FRIDAY recent events");
+    for (_, event_id, path) in events.into_iter().take(5) {
+        let Some(analysis) = read_event_analysis(&path) else {
+            continue;
+        };
+        let summary = if analysis.plain_description.trim().is_empty() {
+            analysis.description.as_str()
+        } else {
+            analysis.plain_description.as_str()
+        };
+        message.push_str(&format!(
+            "\n\n#{event_id}\nPriority: {}\n{}",
+            priority_label(analysis.importance),
+            summary
+        ));
+    }
+    message.push_str("\n\nReply: summary latest, photo latest, video latest, analysis latest, or help");
+    message
+}
+
+fn preferred_photo_path_for_event(uploads_dir: &Path, requested_event_id: &str) -> Option<(String, PathBuf)> {
+    let event_id = resolve_event_id_for_analysis(uploads_dir, requested_event_id)?;
+    for suffix in ["keyframe_1.jpg", "keyframe_0.jpg", "thumbnail.jpg"] {
+        let path = uploads_dir.join(format!("event_{event_id}_{suffix}"));
+        if path.is_file() {
+            return Some((event_id, path));
+        }
+    }
+
+    let mut keyframes = Vec::new();
+    for entry in std::fs::read_dir(uploads_dir).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&format!("event_{event_id}_keyframe_")) && name.ends_with(".jpg") {
+            keyframes.push(path);
+        }
+    }
+    keyframes.sort();
+    keyframes.into_iter().next().map(|path| (event_id, path))
+}
+
+fn help_message() -> &'static str {
+    "🚪 Project FRIDAY commands\n\n\
+events\nShow the last 5 analyzed events.\n\n\
+summary latest\nShow the latest event summary.\n\n\
+photo latest\nSend the latest event photo.\n\n\
+video latest\nSend the latest event video.\n\n\
+analysis latest\nShow the full AI analysis JSON.\n\n\
+resend latest\nForce-send the latest video again.\n\n\
+You can also use an event ID, like: video 1783957936278"
+}
+
 fn send_video_for_event(
     telegram: &TelegramNotifier,
     uploads_dir: &Path,
@@ -551,7 +1018,15 @@ fn send_video_for_event(
                 }
                 return;
             }
-            let caption = format!("Project FRIDAY video for event {resolved_id}");
+            let caption = if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_annotated.mp4") || name.contains("_locked"))
+            {
+                format!("Project FRIDAY locked video for event {resolved_id}")
+            } else {
+                format!("Project FRIDAY video for event {resolved_id}")
+            };
             match telegram.send_document(&path, &caption) {
                 Ok(()) => {
                     sent_video_ids.insert(resolved_id.clone());
@@ -566,6 +1041,98 @@ fn send_video_for_event(
                 println!("telegram commands: failed to send missing-video reply: {e:?}");
             }
         }
+    }
+}
+
+fn send_summary_for_event(telegram: &TelegramNotifier, uploads_dir: &Path, requested_event_id: &str) {
+    match analysis_for_event(uploads_dir, requested_event_id) {
+        Some((event_id, analysis)) => {
+            if let Err(e) = telegram.send_message(&summary_message_for_event(&event_id, &analysis)) {
+                println!("telegram commands: failed to send summary for event {event_id}: {e:?}");
+            }
+        }
+        None => {
+            let msg = match analysis_path_for_event(uploads_dir, requested_event_id) {
+                Some((event_id, _)) => {
+                    format!("AI analysis exists for event {event_id}, but it failed. The photo/video are still saved.")
+                }
+                None => format!("I couldn't find an analysis file for event {requested_event_id}."),
+            };
+            if let Err(e) = telegram.send_message(&msg) {
+                println!("telegram commands: failed to send missing-summary reply: {e:?}");
+            }
+        }
+    }
+}
+
+fn send_analysis_for_event(telegram: &TelegramNotifier, uploads_dir: &Path, requested_event_id: &str) {
+    match analysis_for_event(uploads_dir, requested_event_id) {
+        Some((event_id, analysis)) => {
+            let json = serde_json::to_string_pretty(&analysis).unwrap_or_else(|_| "{}".to_string());
+            let message = format!("Project FRIDAY analysis for event {event_id}\n\n{json}");
+            if let Err(e) = telegram.send_message(&message) {
+                println!("telegram commands: failed to send analysis for event {event_id}: {e:?}");
+            }
+        }
+        None => {
+            let msg = match analysis_path_for_event(uploads_dir, requested_event_id) {
+                Some((event_id, path)) => format!(
+                    "AI analysis failed for event {event_id}. Saved failure file: {}",
+                    path.file_name().and_then(|name| name.to_str()).unwrap_or("analysis.json")
+                ),
+                None => format!("I couldn't find an analysis file for event {requested_event_id}."),
+            };
+            if let Err(e) = telegram.send_message(&msg) {
+                println!("telegram commands: failed to send missing-analysis reply: {e:?}");
+            }
+        }
+    }
+}
+
+fn send_photo_for_event(telegram: &TelegramNotifier, uploads_dir: &Path, requested_event_id: &str) {
+    match preferred_photo_path_for_event(uploads_dir, requested_event_id) {
+        Some((event_id, path)) => {
+            let caption = format!("Project FRIDAY photo for event {event_id}");
+            if let Err(e) = telegram.send_photo(&path, &caption) {
+                println!("telegram commands: failed to send photo for event {event_id}: {e:?}");
+            }
+        }
+        None => {
+            let msg = format!("I couldn't find a photo for event {requested_event_id}.");
+            if let Err(e) = telegram.send_message(&msg) {
+                println!("telegram commands: failed to send missing-photo reply: {e:?}");
+            }
+        }
+    }
+}
+
+fn handle_telegram_command(
+    telegram: &TelegramNotifier,
+    uploads_dir: &Path,
+    command: TelegramCommand,
+    sent_video_ids: &mut std::collections::HashSet<String>,
+) {
+    match command {
+        TelegramCommand::Help => {
+            if let Err(e) = telegram.send_message(help_message()) {
+                println!("telegram commands: failed to send help: {e:?}");
+            }
+        }
+        TelegramCommand::Events => {
+            if let Err(e) = telegram.send_message(&events_list_message(uploads_dir)) {
+                println!("telegram commands: failed to send events list: {e:?}");
+            }
+        }
+        TelegramCommand::Summary(event_id) => send_summary_for_event(telegram, uploads_dir, &event_id),
+        TelegramCommand::Photo(event_id) => send_photo_for_event(telegram, uploads_dir, &event_id),
+        TelegramCommand::Analysis(event_id) => send_analysis_for_event(telegram, uploads_dir, &event_id),
+        TelegramCommand::Video(command) => send_video_for_event(
+            telegram,
+            uploads_dir,
+            &command.event_id,
+            sent_video_ids,
+            command.force_resend,
+        ),
     }
 }
 
@@ -590,7 +1157,7 @@ pub fn spawn_telegram_command_listener(uploads_dir: &'static str) {
     let telegram = TelegramNotifier::new(token, chat_id, TELEGRAM_TIMEOUT);
     let uploads_dir = PathBuf::from(uploads_dir);
     std::thread::spawn(move || {
-        println!("telegram commands: listening for `video <event_id>`");
+        println!("telegram commands: listening for help/events/summary/photo/video/analysis");
         let mut offset = None;
         let mut sent_video_ids = std::collections::HashSet::new();
         loop {
@@ -625,16 +1192,10 @@ pub fn spawn_telegram_command_listener(uploads_dir: &'static str) {
                             let Some(text) = message.text else {
                                 continue;
                             };
-                            let Some(command) = parse_video_command(&text) else {
+                            let Some(command) = parse_telegram_command(&text) else {
                                 continue;
                             };
-                            send_video_for_event(
-                                &telegram,
-                                &uploads_dir,
-                                &command.event_id,
-                                &mut sent_video_ids,
-                                command.force_resend,
-                            );
+                            handle_telegram_command(&telegram, &uploads_dir, command, &mut sent_video_ids);
                         }
                     }
                 }
@@ -692,10 +1253,31 @@ mod tests {
             concerning_details: vec![],
             likely_intent: "visitor".to_string(),
             recommended_action: "Check the video if needed.".to_string(),
+            friday_comment: String::new(),
             importance,
             confidence: 91,
             reason: vec!["A person stayed near the door.".to_string()],
             timeline: vec!["Motion started.".to_string(), "Person remained near the door.".to_string()],
+            regions: vec![
+                AnalysisRegion {
+                    label: "face/head".to_string(),
+                    kind: RegionKind::Face,
+                    x: 570,
+                    y: 100,
+                    w: 300,
+                    h: 300,
+                    confidence: 80,
+                },
+                AnalysisRegion {
+                    label: "person".to_string(),
+                    kind: RegionKind::Person,
+                    x: 470,
+                    y: 40,
+                    w: 450,
+                    h: 760,
+                    confidence: 75,
+                },
+            ],
         }
     }
 
@@ -764,6 +1346,80 @@ mod tests {
     }
 
     #[test]
+    fn alert_message_includes_model_friday_comment() {
+        let policy = NotificationPolicy::default();
+        let mut analysis = analysis(true, false, false, false, Importance::High);
+        analysis.friday_comment = "Bold choice, considering the camera keeps receipts.".to_string();
+        let alert = policy
+            .alert_for(
+                &analysis,
+                Path::new("/tmp/event_1783953798101_thumbnail.jpg"),
+                Path::new("/tmp/event_1783953798101_analysis.json"),
+            )
+            .unwrap();
+
+        let message = alert.message();
+        assert!(message.contains(
+            "FRIDAY says: Bold choice, considering the camera keeps receipts."
+        ));
+    }
+
+    #[test]
+    fn alert_message_adds_safe_fallback_friday_comment_for_concerns() {
+        let policy = NotificationPolicy::default();
+        let mut analysis = analysis(true, false, false, false, Importance::Medium);
+        analysis.concerning_behavior = true;
+        let alert = policy
+            .alert_for(
+                &analysis,
+                Path::new("/tmp/event_1783953798101_thumbnail.jpg"),
+                Path::new("/tmp/event_1783953798101_analysis.json"),
+            )
+            .unwrap();
+
+        let message = alert.message();
+        assert!(message.contains(
+            "FRIDAY says: Bold choice, considering the camera keeps receipts."
+        ));
+    }
+
+    #[test]
+    fn photo_caption_is_shortened_when_full_alert_is_too_long() {
+        let mut analysis = analysis(true, false, false, false, Importance::High);
+        analysis.plain_description = "A person is standing very close to the door camera while holding an object near the lens and continuing to move around the doorway, with enough detail in this sentence to make the complete notification much longer than a Telegram photo caption should carry comfortably.".repeat(3);
+        analysis.notable_actions = vec![
+            "standing close to the camera".to_string(),
+            "holding an object near the lens".to_string(),
+            "moving around the doorway".to_string(),
+            "remaining in view for several seconds".to_string(),
+        ];
+        analysis.reason = vec![
+            "The subject remains close to the door camera for several frames.".to_string(),
+            "The event includes visible hand movement near the recording device.".to_string(),
+            "The clip contains enough context that the full alert should be sent separately.".to_string(),
+        ];
+        analysis.timeline = vec![
+            "Motion begins near the doorway.".to_string(),
+            "The person moves closer to the camera.".to_string(),
+            "The person remains in frame while moving.".to_string(),
+            "The person leaves or becomes less visible.".to_string(),
+        ];
+
+        let alert = Alert {
+            categories: vec![AlertCategory::Visitor, AlertCategory::HighImportance],
+            analysis,
+            thumbnail_path: PathBuf::from("/tmp/event_1783953798101_alert.jpg"),
+        };
+        let full_message = alert.message();
+        let caption = photo_caption_for_alert(&alert, &full_message);
+
+        assert!(full_message.chars().count() > TELEGRAM_PHOTO_CAPTION_SOFT_LIMIT);
+        assert!(caption.chars().count() <= TELEGRAM_PHOTO_CAPTION_SOFT_LIMIT);
+        assert!(caption.contains("Event #1783953798101"));
+        assert!(caption.contains("Full details sent below."));
+    }
+
+    #[test]
     fn alert_message_includes_event_id_and_video_command() {
         let policy = NotificationPolicy::default();
         let alert = policy
@@ -819,6 +1475,65 @@ mod tests {
         assert_eq!(parse_video_command("video abc"), None);
         assert_eq!(parse_video_command("video 123 extra"), None);
         assert_eq!(parse_video_command("hello 123"), None);
+    }
+
+    #[test]
+    fn parses_help_and_lookup_commands() {
+        assert_eq!(parse_telegram_command("help"), Some(TelegramCommand::Help));
+        assert_eq!(parse_telegram_command("/start"), Some(TelegramCommand::Help));
+        assert_eq!(parse_telegram_command("commands"), Some(TelegramCommand::Help));
+        assert_eq!(parse_telegram_command("events"), Some(TelegramCommand::Events));
+        assert_eq!(
+            parse_telegram_command("summary latest"),
+            Some(TelegramCommand::Summary("latest".to_string()))
+        );
+        assert_eq!(
+            parse_telegram_command("photo 1783957936278"),
+            Some(TelegramCommand::Photo("1783957936278".to_string()))
+        );
+        assert_eq!(
+            parse_telegram_command("analysis"),
+            Some(TelegramCommand::Analysis("latest".to_string()))
+        );
+        assert_eq!(
+            parse_telegram_command("resend latest"),
+            Some(TelegramCommand::Video(VideoCommand {
+                event_id: "latest".to_string(),
+                force_resend: true
+            }))
+        );
+        assert_eq!(parse_telegram_command("summary abc"), None);
+    }
+
+    #[test]
+    fn events_list_uses_latest_analysis_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "camera_server_test_notify_events_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stored = serde_json::json!({
+            "event_analysis": analysis(true, false, false, false, Importance::High),
+            "identity": {"status": "not_enabled", "known_person_id": null, "display_name": null, "confidence": null},
+            "ai": {"provider": "ollama", "model": "qwen3.5:4b", "status": "success"}
+        });
+        std::fs::write(
+            dir.join("event_1783957936278_analysis.json"),
+            serde_json::to_string_pretty(&stored).unwrap(),
+        )
+        .unwrap();
+
+        let message = events_list_message(&dir);
+        assert!(message.contains("Project FRIDAY recent events"));
+        assert!(message.contains("#1783957936278"));
+        assert!(message.contains("Priority: High"));
+        assert!(message.contains("A person is standing near the door."));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

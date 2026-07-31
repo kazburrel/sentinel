@@ -55,10 +55,22 @@ Return JSON only with exactly these fields:
   "concerning_details": [string],
   "likely_intent": string,
   "recommended_action": string,
+  "friday_comment": string,
   "importance": "low" | "medium" | "high" | "critical",
   "confidence": number,
   "reason": [string],
-  "timeline": [string]
+  "timeline": [string],
+  "regions": [
+    {
+      "label": string,
+      "kind": "person" | "face" | "package" | "knife" | "object" | "gesture" | "door" | "unknown",
+      "x": number,
+      "y": number,
+      "w": number,
+      "h": number,
+      "confidence": number
+    }
+  ]
 }
 
 Rules:
@@ -75,9 +87,18 @@ Rules:
 - concerning_details must list specific concerns only. Use an empty array if there are no real concerns.
 - likely_intent must be a short best-effort interpretation such as "visitor", "delivery", "walk-by", "possible nuisance gesture", "possible threat", "door/camera tampering", or "unclear".
 - recommended_action must be practical, for example "No action needed", "Check the video", "Review before responding", "Do not open the door until verified", or "Consider calling for help if this is live."
+- friday_comment is an optional private notification comment from FRIDAY. Use an empty string for normal/low-risk events. For hostile gestures, tampering, threats, or concerning objects, make it short, witty, and mildly roasting, like a security assistant with personality.
+- friday_comment must stay safe: no slurs, no protected-trait insults, no body shaming, no sexual comments, no threats of violence, and no instructions to harm anyone.
+- friday_comment must be one sentence under 120 characters. Examples: "Bold choice, considering the camera keeps receipts.", "Kitchenware at the door? Hard pass.", "Interesting hobby: losing to a doorbell camera."
 - confidence must be an integer from 0 to 100.
 - reason must contain 1 to 4 short practical reasons.
 - timeline must contain 1 to 5 short event steps inferred from the thumbnail/keyframes.
+- regions must contain 0 to 6 approximate boxes for important visible things in the most useful frame/keyframe.
+- Region coordinates are normalized integers from 0 to 1000, relative to the image exactly as provided, where x/y is top-left and w/h is width/height.
+- Include a face/head region if a face/head is visible.
+- Include a person region if a person is visible.
+- Include package, knife/sharp-object, concerning object, or gesture regions when visible.
+- Use broad boxes with lower confidence if exact edges are uncertain; do not invent a region for something not visible.
 - If a person appears in any frame, set person to true.
 - If a package appears in any frame, set package to true.
 - If a vehicle appears in any frame, set vehicle to true.
@@ -104,18 +125,56 @@ pub struct EventAnalysis {
     pub package: bool,
     pub vehicle: bool,
     pub animal: bool,
+    #[serde(default)]
     pub concerning_object: bool,
+    #[serde(default)]
     pub concerning_behavior: bool,
     pub description: String,
+    #[serde(default)]
     pub plain_description: String,
+    #[serde(default)]
     pub notable_actions: Vec<String>,
+    #[serde(default)]
     pub concerning_details: Vec<String>,
+    #[serde(default)]
     pub likely_intent: String,
+    #[serde(default)]
     pub recommended_action: String,
+    #[serde(default)]
+    pub friday_comment: String,
     pub importance: Importance,
+    #[serde(default)]
     pub confidence: u8,
+    #[serde(default)]
     pub reason: Vec<String>,
+    #[serde(default)]
     pub timeline: Vec<String>,
+    #[serde(default)]
+    pub regions: Vec<AnalysisRegion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisRegion {
+    pub label: String,
+    pub kind: RegionKind,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    pub confidence: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegionKind {
+    Person,
+    Face,
+    Package,
+    Knife,
+    Object,
+    Gesture,
+    Door,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,10 +531,31 @@ mod tests {
             concerning_details: vec![],
             likely_intent: "visitor".to_string(),
             recommended_action: "Check the video if needed.".to_string(),
+            friday_comment: String::new(),
             importance: Importance::Medium,
             confidence: 87,
             reason: vec!["A person appears in the event frames.".to_string()],
             timeline: vec!["Motion started near the door.".to_string()],
+            regions: vec![
+                AnalysisRegion {
+                    label: "face/head".to_string(),
+                    kind: RegionKind::Face,
+                    x: 570,
+                    y: 100,
+                    w: 300,
+                    h: 300,
+                    confidence: 80,
+                },
+                AnalysisRegion {
+                    label: "person".to_string(),
+                    kind: RegionKind::Person,
+                    x: 470,
+                    y: 40,
+                    w: 450,
+                    h: 760,
+                    confidence: 75,
+                },
+            ],
         }
     }
 
@@ -652,12 +732,13 @@ mod tests {
 
     #[test]
     fn parses_a_markdown_fenced_response() {
-        let fenced = "```json\n{\"person\":false,\"package\":true,\"vehicle\":false,\"animal\":false,\"concerning_object\":false,\"concerning_behavior\":false,\"description\":\"This looks like a delivery.\",\"plain_description\":\"A package appears near the door.\",\"notable_actions\":[\"package left near door\"],\"concerning_details\":[],\"likely_intent\":\"delivery\",\"recommended_action\":\"Check the package when convenient.\",\"importance\":\"high\",\"confidence\":92,\"reason\":[\"A package-like object is visible.\"],\"timeline\":[\"A package appears near the door.\"]}\n```";
+        let fenced = "```json\n{\"person\":false,\"package\":true,\"vehicle\":false,\"animal\":false,\"concerning_object\":false,\"concerning_behavior\":false,\"description\":\"This looks like a delivery.\",\"plain_description\":\"A package appears near the door.\",\"notable_actions\":[\"package left near door\"],\"concerning_details\":[],\"likely_intent\":\"delivery\",\"recommended_action\":\"Check the package when convenient.\",\"friday_comment\":\"\",\"importance\":\"high\",\"confidence\":92,\"reason\":[\"A package-like object is visible.\"],\"timeline\":[\"A package appears near the door.\"],\"regions\":[{\"label\":\"package\",\"kind\":\"package\",\"x\":100,\"y\":500,\"w\":300,\"h\":250,\"confidence\":88}]}\n```";
         let parsed = parse_event_analysis(fenced).expect("fenced JSON should still parse");
         assert_eq!(parsed.package, true);
         assert_eq!(parsed.importance, Importance::High);
         assert_eq!(parsed.confidence, 92);
         assert_eq!(parsed.likely_intent, "delivery");
+        assert_eq!(parsed.regions[0].kind, RegionKind::Package);
     }
 
     #[test]
