@@ -94,9 +94,9 @@ Before a real-media release, also verify:
 - Both OpenCV face models exist under `scripts/models/`, their SHA-256 hashes match
   `scripts/models/README.md`, and the configured Python environment provides the
   pinned OpenCV version from `scripts/requirements-tracker.txt`.
-- A known-admin routine event is suppressed, while a known-admin threat event still
-  alerts. Any missing model/profile/sidecar must fail open as an unknown person, never
-  silently suppress a notification.
+- A confident Kaz/admin match suppresses notification for both routine and
+  threat-classified events. Weak, unknown, multiple-face, missing-model, missing-profile,
+  or failed-sidecar results must never silently suppress a notification.
 
 ### Firmware gate
 

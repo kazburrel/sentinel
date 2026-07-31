@@ -278,10 +278,7 @@ impl NotificationPolicy {
         thumbnail_path: &Path,
         _analysis_path: &Path,
     ) -> Option<Alert> {
-        let threat_override = analysis.concerning_object
-            || analysis.concerning_behavior
-            || matches!(analysis.importance, Importance::Critical);
-        if identity.is_known() && !threat_override {
+        if identity.is_known() {
             return None;
         }
 
@@ -1327,7 +1324,7 @@ mod tests {
         Identity {
             status: "known".to_string(),
             known_person_id: Some("admin".to_string()),
-            display_name: Some("Admin".to_string()),
+            display_name: Some("Kaz".to_string()),
             confidence: Some(0.82),
         }
     }
@@ -1366,20 +1363,17 @@ mod tests {
     }
 
     #[test]
-    fn threat_signal_overrides_known_admin_suppression() {
+    fn known_admin_suppresses_even_a_threat_alert() {
         let policy = NotificationPolicy::default();
         let mut event = analysis(true, false, false, false, Importance::High);
         event.concerning_object = true;
-        let alert = policy
-            .alert_for_identity(
-                &event,
-                &known_admin(),
-                Path::new("event_1_thumbnail.jpg"),
-                Path::new("event_1_analysis.json"),
-            )
-            .expect("a threat must notify even when the person is known");
-        assert!(alert.categories.contains(&AlertCategory::SecurityConcern));
-        assert!(alert.message().contains("Identity: Admin (82% match)"));
+        let alert = policy.alert_for_identity(
+            &event,
+            &known_admin(),
+            Path::new("event_1_thumbnail.jpg"),
+            Path::new("event_1_analysis.json"),
+        );
+        assert!(alert.is_none());
     }
 
     #[test]

@@ -2137,14 +2137,14 @@ PIR, recording, upload, SD queue, or Telegram timing sequence.
   against local identity profiles. The official OpenCV Zoo YuNet/SFace models and
   their SHA-256 hashes are documented under `scripts/models/`; both are Apache-2.0.
 - **Private enrollment**: confirmed event `1784135006831` was enrolled as person ID
-  `admin`, display name `Admin`, from six usable event frames. Only embeddings are
+  `admin`, display name `Kaz`, from six usable event frames. Only embeddings are
   stored in `server/identities/admin.json`; the profile directory is mode `0700`, the
   profile is mode `0600`, and `server/identities/` is gitignored so biometric data is
   never pushed. Enrollment photos are never copied into the profile.
 - **Conservative matching**: default cosine threshold is `0.50`; two matching event
   images confirm identity, or one image must pass the stricter `0.65` threshold.
   Weak/blurred faces remain `unknown`, missing faces become `no_face`, and any frame
-  containing multiple faces becomes `multiple_faces` so an Admin standing beside an
+  containing multiple faces becomes `multiple_faces` so Kaz standing beside an
   unknown visitor can never suppress the visitor alert. Any model, sidecar, or profile
   failure fails open as an ordinary unknown-person alert rather than suppressing it.
   Thresholds can be tuned with `FRIDAY_FACE_MATCH_THRESHOLD` and
@@ -2153,20 +2153,21 @@ PIR, recording, upload, SD queue, or Telegram timing sequence.
   and before Ollama scene analysis. `analysis.json` now preserves the local identity
   result even if scene analysis fails. Ollama's prompt still explicitly forbids
   identification; it never receives identity names or performs the match.
-- **Admin-aware notifications**: routine events confidently matched to Admin are
-  recorded, uploaded, analyzed, and retained normally but do not send a Telegram
-  alert. `concerning_object`, `concerning_behavior`, or `critical` importance always
-  overrides suppression. Threat notifications name the recognized Admin and include
-  match confidence.
+- **Kaz-aware notifications**: events confidently matched to Kaz are recorded,
+  uploaded, analyzed, and retained normally but do not send a Telegram alert, even
+  when scene analysis marks an object, behavior, or importance as concerning. Weak,
+  unknown, failed, and multiple-face matches never suppress an alert.
 - **Real console-only replay verification**: replayed the clear knife/gesture frame
   from confirmed admin event `1784135006831` through a release server with Telegram
   deliberately disabled. The stored result was `identity.status=known`,
   `known_person_id=admin`, `display_name=Admin`, confidence `1.0`; Ollama marked both
-  `concerning_object` and `concerning_behavior`; and the notification policy emitted
-  the threat alert with `Identity: Admin (100% match)`. The synthetic replay artifacts
-  were removed afterward. No development notification was sent to the real chat.
-- **Checks**: 72 server tests + 12 shared tests pass, including admin suppression,
-  threat override, identity parsing/validation, and identity persistence through AI.
+  `concerning_object` and `concerning_behavior`; and the then-current notification
+  policy emitted a console-only threat alert. The policy was subsequently changed so
+  a confident Kaz match suppresses that alert while retaining the objective analysis.
+  The synthetic replay artifacts were removed afterward. No development notification
+  was sent to the real chat.
+- **Checks**: 72 server tests + 12 shared tests pass, including full Kaz suppression,
+  identity parsing/validation, and identity persistence through AI.
   Sixteen Python identity/tracking tests pass; Python compile and
   `cargo clippy -p server -- -D warnings` are clean.
 
@@ -2174,7 +2175,7 @@ To replace or expand the local admin profile, run from the repository root:
 
 ```sh
 .venv-tracker/bin/python scripts/face_identity.py enroll \
-  --person-id admin --display-name Admin \
+  --person-id admin --display-name Kaz \
   --output server/identities/admin.json \
   /path/to/clear-admin-frame-1.jpg /path/to/clear-admin-frame-2.jpg
 ```
