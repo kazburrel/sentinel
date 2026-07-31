@@ -1,10 +1,15 @@
 import unittest
+from types import SimpleNamespace
 
 from scripts.track_video import (
     BodyBoxStabilizer,
     FaceBoxStabilizer,
+    GestureLatch,
     ThreatLatch,
+    is_middle_finger_gesture,
+    level_for_detection,
     plausible_face_for_person,
+    suppress_nested_people,
 )
 
 
@@ -23,6 +28,15 @@ def detection(kind: str, track_id: int | None, x1: int, y1: int, x2: int, y2: in
 
 
 class BodyBoxStabilizerTests(unittest.TestCase):
+    def test_suppresses_nested_duplicate_people_but_keeps_separate_people(self) -> None:
+        broad = detection("person", 1, 20, 10, 300, 450)
+        nested = detection("person", 2, 80, 90, 240, 380)
+        separate = detection("person", 3, 400, 20, 600, 430)
+
+        output = suppress_nested_people([nested, separate, broad])
+
+        self.assertEqual({item["track_id"] for item in output}, {1, 3})
+
     def test_smooths_a_jittering_tracked_person(self) -> None:
         stabilizer = BodyBoxStabilizer(smoothing=0.25, hold_frames=2)
         first = stabilizer.update([detection("person", 7, 0, 0, 100, 200)], 640, 480)[0]
@@ -48,12 +62,13 @@ class BodyBoxStabilizerTests(unittest.TestCase):
         self.assertIsNone(first_miss[0]["raw_box"])
         self.assertEqual(expired, [])
 
-    def test_does_not_draw_stale_id_over_live_replacement(self) -> None:
+    def test_remaps_an_overlapping_replacement_id_to_the_existing_track(self) -> None:
         stabilizer = BodyBoxStabilizer(smoothing=0.30, hold_frames=3)
         stabilizer.update([detection("person", 1, 100, 40, 220, 300)], 640, 480)
         output = stabilizer.update([detection("person", 2, 102, 42, 222, 302)], 640, 480)
 
-        self.assertEqual([item["track_id"] for item in output], [2])
+        self.assertEqual([item["track_id"] for item in output], [1])
+        self.assertEqual(output[0]["source_track_id"], 2)
 
 
 class FaceBoxStabilizerTests(unittest.TestCase):
@@ -103,6 +118,60 @@ class ThreatLatchTests(unittest.TestCase):
         self.assertEqual(latch.update([]), "threat")
         self.assertEqual(latch.update([]), "threat")
         self.assertEqual(latch.update([]), "normal")
+
+
+def point(x: float, y: float, z: float = 0.0) -> SimpleNamespace:
+    return SimpleNamespace(x=x, y=y, z=z)
+
+
+def synthetic_middle_finger() -> list[SimpleNamespace]:
+    landmarks = [point(0, 0) for _ in range(21)]
+    # Fold index, ring, and pinky at 90-degree joints.
+    for mcp, pip, dip, tip, x in (
+        (5, 6, 7, 8, 1.0),
+        (13, 14, 15, 16, 3.0),
+        (17, 18, 19, 20, 4.0),
+    ):
+        landmarks[mcp] = point(x, 0)
+        landmarks[pip] = point(x, 1)
+        landmarks[dip] = point(x + 1, 1)
+        landmarks[tip] = point(x + 1, 0)
+    # Keep only the middle finger straight.
+    landmarks[9] = point(2, 0)
+    landmarks[10] = point(2, 1)
+    landmarks[11] = point(2, 2)
+    landmarks[12] = point(2, 3)
+    return landmarks
+
+
+class GestureTests(unittest.TestCase):
+    def test_recognizes_middle_finger_geometry_but_not_peace_sign(self) -> None:
+        landmarks = synthetic_middle_finger()
+        self.assertTrue(is_middle_finger_gesture(landmarks))
+
+        # Extend the index too: this is now a two-finger/peace shape and must
+        # not be treated as an obscene gesture.
+        landmarks[5] = point(1, 0)
+        landmarks[6] = point(1, 1)
+        landmarks[7] = point(1, 2)
+        landmarks[8] = point(1, 3)
+        self.assertFalse(is_middle_finger_gesture(landmarks))
+
+    def test_gesture_latch_confirms_then_holds_per_track(self) -> None:
+        latch = GestureLatch(confirmation_frames=2, hold_frames=2)
+        gesture = detection("gesture", 9, 10, 10, 40, 50)
+
+        self.assertEqual(latch.update([gesture]), set())
+        self.assertEqual(latch.update([gesture]), {9})
+        self.assertEqual(latch.update([]), {9})
+        self.assertEqual(latch.update([]), {9})
+        self.assertEqual(latch.update([]), set())
+
+    def test_red_overrides_gesture_yellow_for_the_same_person(self) -> None:
+        person = detection("person", 9, 10, 10, 100, 200)
+
+        self.assertEqual(level_for_detection(person, "normal", {9}), "minimal")
+        self.assertEqual(level_for_detection(person, "threat", {9}), "threat")
 
 
 if __name__ == "__main__":

@@ -3,8 +3,9 @@
 
 This is intentionally a local sidecar instead of Rust inference. The Rust
 server calls it when a Telegram video is requested. It uses Ultralytics YOLO's
-tracking mode (ByteTrack by default) to detect/track objects per frame, writes
-`tracks.json`, and renders a new locked MP4 with boxes burned into the video.
+tracking mode (ByteTrack by default), OpenCV YuNet faces, and MediaPipe hand
+landmarks to detect/track objects and gestures per frame, writes `tracks.json`,
+and renders a new locked MP4 with boxes burned into the video.
 
 Install dependencies later with:
 
@@ -22,6 +23,7 @@ import math
 import shutil
 import subprocess
 import sys
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="yolo11n.pt", help="Ultralytics YOLO model path/name")
     parser.add_argument("--tracker", default="bytetrack.yaml", help="Ultralytics tracker config")
     parser.add_argument("--conf", default=0.25, type=float, help="Detection confidence threshold")
+    parser.add_argument(
+        "--imgsz",
+        default=960,
+        type=int,
+        help="YOLO inference size. 960 improves small concerning-object recall over the 640 default.",
+    )
     parser.add_argument("--face-model", default=str(DEFAULT_FACE_MODEL), help="OpenCV YuNet face detector ONNX path")
     parser.add_argument("--face-conf", default=0.45, type=float, help="Face detector confidence threshold")
     parser.add_argument(
@@ -63,6 +71,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Frames to predict/hold a body or face through a brief missed detection.",
     )
+    parser.add_argument("--hand-conf", default=0.35, type=float, help="MediaPipe hand detection confidence")
+    parser.add_argument(
+        "--gesture-confirm-frames",
+        default=2,
+        type=int,
+        help="Consecutive middle-finger landmark matches required before yellow lock.",
+    )
+    parser.add_argument(
+        "--gesture-hold-frames",
+        default=18,
+        type=int,
+        help="Frames to keep a confirmed gesture's person yellow after the hand disappears.",
+    )
     parser.add_argument(
         "--threat-level",
         default="normal",
@@ -74,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         default=40,
         type=int,
         help="Frames to keep person/face red after a concerning object last appeared.",
+    )
+    parser.add_argument(
+        "--threat-preroll-frames",
+        default=18,
+        type=int,
+        help="Buffered frames to recolor red immediately before the first delayed object detection.",
     )
     parser.add_argument(
         "--concerning-behavior",
@@ -187,7 +214,32 @@ class BodyBoxStabilizer:
                 output.append(passthrough)
                 continue
 
-            track_id = int(track_id)
+            source_track_id = int(track_id)
+            track_id = source_track_id
+            if track_id not in self.states:
+                best_match: tuple[float, int] | None = None
+                for existing_id, existing_state in self.states.items():
+                    if existing_id in seen:
+                        continue
+                    existing_box = existing_state.template.copy()
+                    set_box(
+                        existing_box,
+                        existing_state.cx,
+                        existing_state.cy,
+                        existing_state.width,
+                        existing_state.height,
+                        frame_width,
+                        frame_height,
+                    )
+                    score = intersection_over_smaller(detection, existing_box)
+                    if score > 0.55 and (best_match is None or score > best_match[0]):
+                        best_match = (score, existing_id)
+                if best_match is not None:
+                    track_id = best_match[1]
+
+            detection = detection.copy()
+            detection["source_track_id"] = source_track_id
+            detection["track_id"] = track_id
             seen.add(track_id)
             measured_cx, measured_cy, measured_width, measured_height = box_center_size(detection)
             state = self.states.get(track_id)
@@ -447,12 +499,187 @@ class ThreatLatch:
             # behavior, otherwise back to white.
             return "minimal" if self.concerning_behavior else "normal"
         if self.event_threat_level == "minimal":
-            # No object has appeared this clip at all -- we do not have a
-            # reliable local gesture detector yet, so gesture-only concern
-            # still comes from the event-level AI analysis, held for the
-            # whole clip rather than per frame.
+            # Keep the event-level result as a fallback when the local hand
+            # detector cannot see enough detail to recognize the gesture.
             return "minimal"
         return "normal"
+
+
+def joint_angle(a: Any, b: Any, c: Any) -> float:
+    first = (float(a.x) - float(b.x), float(a.y) - float(b.y), float(a.z) - float(b.z))
+    second = (float(c.x) - float(b.x), float(c.y) - float(b.y), float(c.z) - float(b.z))
+    denominator = math.sqrt(sum(value * value for value in first)) * math.sqrt(
+        sum(value * value for value in second)
+    )
+    if denominator <= 1e-9:
+        return 0.0
+    cosine = clamp(sum(x * y for x, y in zip(first, second)) / denominator, -1.0, 1.0)
+    return math.degrees(math.acos(cosine))
+
+
+def is_middle_finger_gesture(landmarks: list[Any]) -> bool:
+    """Orientation-independent middle-finger geometry from 21 hand landmarks."""
+
+    if len(landmarks) < 21:
+        return False
+
+    def finger_angles(mcp: int, pip: int, dip: int, tip: int) -> tuple[float, float]:
+        return (
+            joint_angle(landmarks[mcp], landmarks[pip], landmarks[dip]),
+            joint_angle(landmarks[pip], landmarks[dip], landmarks[tip]),
+        )
+
+    index = finger_angles(5, 6, 7, 8)
+    middle = finger_angles(9, 10, 11, 12)
+    ring = finger_angles(13, 14, 15, 16)
+    pinky = finger_angles(17, 18, 19, 20)
+
+    middle_extended = middle[0] >= 155.0 and middle[1] >= 155.0
+    # Requiring every neighboring finger to be folded avoids calling a peace
+    # sign (index + middle extended) an obscene gesture.
+    others_folded = all(pip < 145.0 or dip < 145.0 for pip, dip in (index, ring, pinky))
+    return middle_extended and others_folded
+
+
+def distance_from_point_to_box(cx: float, cy: float, box: dict[str, Any]) -> float:
+    dx = max(float(box["x1"]) - cx, 0.0, cx - float(box["x2"]))
+    dy = max(float(box["y1"]) - cy, 0.0, cy - float(box["y2"]))
+    return math.hypot(dx, dy)
+
+
+class HandGestureDetector:
+    """Detect a middle-finger gesture and associate it with a body track."""
+
+    def __init__(self, confidence: float) -> None:
+        self.enabled = False
+        self.hands = None
+        try:
+            import mediapipe as mp
+
+            self.hands = mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                model_complexity=1,
+                min_detection_confidence=clamp(confidence, 0.1, 0.9),
+                min_tracking_confidence=clamp(confidence, 0.1, 0.9),
+            )
+            self.enabled = True
+        except Exception as exc:  # noqa: BLE001 - optional sidecar capability.
+            print(f"tracker: MediaPipe hand detector disabled: {exc}", file=sys.stderr)
+
+    def detect(
+        self,
+        frame: Any,
+        people: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not self.enabled or self.hands is None:
+            return []
+
+        import cv2
+
+        height, width = frame.shape[:2]
+        try:
+            result = self.hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        except Exception as exc:  # noqa: BLE001 - degrade to event-level gesture context.
+            print(f"tracker: MediaPipe hand detector failed; disabling it: {exc}", file=sys.stderr)
+            self.enabled = False
+            return []
+        output: list[dict[str, Any]] = []
+        handedness = result.multi_handedness or []
+        for index, hand in enumerate(result.multi_hand_landmarks or []):
+            landmarks = list(hand.landmark)
+            if not is_middle_finger_gesture(landmarks):
+                continue
+
+            xs = [point.x * width for point in landmarks]
+            ys = [point.y * height for point in landmarks]
+            padding = max(8.0, 0.12 * max(max(xs) - min(xs), max(ys) - min(ys)))
+            x1 = int(clamp(min(xs) - padding, 0, width - 2))
+            y1 = int(clamp(min(ys) - padding, 0, height - 2))
+            x2 = int(clamp(max(xs) + padding, x1 + 1, width - 1))
+            y2 = int(clamp(max(ys) + padding, y1 + 1, height - 1))
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+
+            candidates: list[tuple[float, dict[str, Any]]] = []
+            for person in people:
+                if person.get("track_id") is None:
+                    continue
+                distance = distance_from_point_to_box(cx, cy, person)
+                _, _, person_width, person_height = box_center_size(person)
+                normalized_distance = distance / max(1.0, math.hypot(person_width, person_height))
+                if normalized_distance <= 0.30:
+                    candidates.append((normalized_distance, person))
+            if not candidates:
+                continue
+
+            _, person = min(candidates, key=lambda item: item[0])
+            confidence = 1.0
+            if index < len(handedness) and handedness[index].classification:
+                confidence = float(handedness[index].classification[0].score)
+            output.append(
+                {
+                    "track_id": int(person["track_id"]),
+                    "kind": "gesture",
+                    "label": "middle finger",
+                    "confidence": round(confidence, 4),
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "source": "mediapipe_hands",
+                    "raw_box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    "stabilized": False,
+                    "held": False,
+                }
+            )
+        best_per_person: dict[int, dict[str, Any]] = {}
+        for detection in output:
+            track_id = int(detection["track_id"])
+            existing = best_per_person.get(track_id)
+            if existing is None or detection["confidence"] > existing["confidence"]:
+                best_per_person[track_id] = detection
+        return list(best_per_person.values())
+
+    def close(self) -> None:
+        if self.hands is not None:
+            self.hands.close()
+
+
+@dataclass
+class GestureTrackState:
+    hits: int = 0
+    remaining: int = 0
+
+
+class GestureLatch:
+    """Debounce local gesture evidence and hold yellow per person track."""
+
+    def __init__(self, confirmation_frames: int, hold_frames: int) -> None:
+        self.confirmation_frames = max(1, confirmation_frames)
+        self.hold_frames = max(0, hold_frames)
+        self.states: dict[int, GestureTrackState] = {}
+
+    def update(self, detections: list[dict[str, Any]]) -> set[int]:
+        detected = {int(det["track_id"]) for det in detections if det.get("track_id") is not None}
+        for track_id in detected:
+            state = self.states.setdefault(track_id, GestureTrackState())
+            state.hits += 1
+            if state.hits >= self.confirmation_frames:
+                state.remaining = self.hold_frames
+
+        active: set[int] = set()
+        for track_id, state in list(self.states.items()):
+            if track_id not in detected:
+                state.hits = 0
+                if state.remaining > 0:
+                    active.add(track_id)
+                    state.remaining -= 1
+            elif state.remaining > 0:
+                active.add(track_id)
+            if state.remaining == 0 and state.hits == 0 and track_id not in active:
+                del self.states[track_id]
+        return active
 
 
 def color_for_kind(kind: str, frame_level: str) -> tuple[int, int, int]:
@@ -461,11 +688,30 @@ def color_for_kind(kind: str, frame_level: str) -> tuple[int, int, int]:
         return (0, 0, 255)
     if kind == "package":
         return (0, 255, 0)
+    if kind == "gesture":
+        return (0, 255, 255)
     if kind in {"face", "head", "person"} and frame_level == "threat":
         return (0, 0, 255)
     if kind in {"face", "head", "person"} and frame_level == "minimal":
         return (0, 255, 255)
     return (255, 255, 255)
+
+
+def level_for_detection(
+    detection: dict[str, Any],
+    frame_level: str,
+    gesture_track_ids: set[int],
+) -> str:
+    if frame_level == "threat":
+        return "threat"
+    track_id = detection.get("track_id")
+    if detection["kind"] == "gesture" or (
+        detection["kind"] in {"person", "face", "head"}
+        and track_id is not None
+        and int(track_id) in gesture_track_ids
+    ):
+        return "minimal"
+    return frame_level
 
 
 def draw_label(frame: Any, text: str, x1: int, y1: int, color: tuple[int, int, int]) -> None:
@@ -506,6 +752,40 @@ def rotate_frame(frame: Any, rotation: int) -> Any:
     raise ValueError(f"unsupported rotation: {rotation}")
 
 
+def choose_frame_rotation(video_path: Path, model_path: Path, threshold: float) -> int:
+    """Choose one clip-wide rotation from face confidence on sampled frames."""
+
+    import cv2
+
+    if not model_path.is_file() or not hasattr(cv2, "FaceDetectorYN_create"):
+        return 0
+    capture = cv2.VideoCapture(str(video_path))
+    frame_total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if frame_total <= 0:
+        capture.release()
+        return 0
+
+    detector = cv2.FaceDetectorYN_create(str(model_path), "", (320, 320), threshold, 0.3, 5000)
+    scores = {rotation: 0.0 for rotation in (0, 90, 180, 270)}
+    sample_indexes = sorted({int((frame_total - 1) * fraction) for fraction in (0.15, 0.35, 0.55, 0.75, 0.90)})
+    for frame_index in sample_indexes:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok:
+            continue
+        for rotation in scores:
+            rotated = rotate_frame(frame, rotation)
+            height, width = rotated.shape[:2]
+            detector.setInputSize((width, height))
+            _, faces = detector.detect(rotated)
+            if faces is not None:
+                scores[rotation] += max(float(face[-1]) for face in faces)
+    capture.release()
+
+    best_rotation = max(scores, key=lambda rotation: (scores[rotation], rotation == 0))
+    return best_rotation if scores[best_rotation] >= threshold else 0
+
+
 def unrotate_box(x: float, y: float, w: float, h: float, rotation: int, width: int, height: int) -> tuple[int, int, int, int]:
     if rotation == 0:
         x1, y1, x2, y2 = x, y, x + w, y + h
@@ -537,6 +817,36 @@ def box_iou(a: dict[str, Any], b: dict[str, Any]) -> float:
     return inter / denom if denom else 0.0
 
 
+def intersection_over_smaller(a: dict[str, Any], b: dict[str, Any]) -> float:
+    x1 = max(a["x1"], b["x1"])
+    y1 = max(a["y1"], b["y1"])
+    x2 = min(a["x2"], b["x2"])
+    y2 = min(a["y2"], b["y2"])
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = max(1, (a["x2"] - a["x1"]) * (a["y2"] - a["y1"]))
+    area_b = max(1, (b["x2"] - b["x1"]) * (b["y2"] - b["y1"]))
+    return intersection / min(area_a, area_b)
+
+
+def suppress_nested_people(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prefer the broad body box when YOLO emits nested duplicate people."""
+
+    ordered = sorted(
+        detections,
+        key=lambda det: (
+            (det["x2"] - det["x1"]) * (det["y2"] - det["y1"]),
+            det.get("confidence", 0.0),
+        ),
+        reverse=True,
+    )
+    kept: list[dict[str, Any]] = []
+    for detection in ordered:
+        if any(intersection_over_smaller(detection, existing) > 0.60 for existing in kept):
+            continue
+        kept.append(detection)
+    return kept
+
+
 def contains_center(outer: dict[str, Any], inner: dict[str, Any]) -> bool:
     cx = (inner["x1"] + inner["x2"]) / 2
     cy = (inner["y1"] + inner["y2"]) / 2
@@ -562,7 +872,7 @@ def plausible_face_for_person(person: dict[str, Any], face: dict[str, Any]) -> b
         face_width / person_width <= 0.70
         and face_height / person_height <= 0.45
         and relative_area <= 0.25
-        and relative_center_y <= 0.55
+        and relative_center_y <= 0.45
     )
 
 
@@ -575,12 +885,13 @@ def status_text_for(frame_level: str) -> str:
 
 
 class FaceDetector:
-    def __init__(self, model_path: Path, threshold: float) -> None:
+    def __init__(self, model_path: Path, threshold: float, rotations: tuple[int, ...] = (0, 90, 180, 270)) -> None:
         import cv2
 
         self.enabled = model_path.is_file() and hasattr(cv2, "FaceDetectorYN_create")
         self.detector = None
         self.threshold = threshold
+        self.rotations = rotations
         if self.enabled:
             self.detector = cv2.FaceDetectorYN_create(str(model_path), "", (320, 320), threshold, 0.3, 5000)
         else:
@@ -592,7 +903,7 @@ class FaceDetector:
 
         height, width = frame.shape[:2]
         raw_faces: list[dict[str, Any]] = []
-        for rotation in (0, 90, 180, 270):
+        for rotation in self.rotations:
             rotated = rotate_frame(frame, rotation)
             rh, rw = rotated.shape[:2]
             self.detector.setInputSize((rw, rh))
@@ -696,9 +1007,14 @@ def main() -> int:
 
     cap = cv2.VideoCapture(str(args.input))
     fps = cap.get(cv2.CAP_PROP_FPS) or 10.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+    input_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+    input_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
     cap.release()
+    frame_rotation = choose_frame_rotation(Path(args.input), Path(args.face_model), args.face_conf)
+    if frame_rotation in {90, 270}:
+        width, height = input_height, input_width
+    else:
+        width, height = input_width, input_height
     if width <= 0 or height <= 0:
         print(f"tracker: invalid video dimensions for {args.input}", file=sys.stderr)
         return 4
@@ -711,26 +1027,91 @@ def main() -> int:
         return 5
 
     model = YOLO(args.model)
-    face_detector = FaceDetector(Path(args.face_model), args.face_conf)
+    face_detector = FaceDetector(Path(args.face_model), args.face_conf, rotations=(0,))
+    gesture_detector = HandGestureDetector(args.hand_conf)
     names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
     threat_latch = ThreatLatch(args.threat_hold_frames, args.threat_level, args.concerning_behavior)
+    gesture_latch = GestureLatch(args.gesture_confirm_frames, args.gesture_hold_frames)
     body_stabilizer = BodyBoxStabilizer(args.body_smoothing, args.track_hold_frames)
     face_stabilizer = FaceBoxStabilizer(args.face_smoothing, args.track_hold_frames)
+    gesture_box_stabilizer = FaceBoxStabilizer(args.face_smoothing, 0)
+    pending: deque[dict[str, Any]] = deque()
     frames: list[dict[str, Any]] = []
     frame_count = 0
     detection_count = 0
     held_detection_count = 0
+    gesture_frame_count = 0
+    threat_preroll_frame_count = 0
 
-    results = model.track(
-        source=str(args.input),
-        stream=True,
-        persist=True,
-        tracker=args.tracker,
-        conf=args.conf,
-        verbose=False,
-    )
+    def render_record(record: dict[str, Any]) -> None:
+        nonlocal detection_count, gesture_frame_count, held_detection_count, threat_preroll_frame_count
+        frame = record["image"]
+        frame_level = "threat" if record["forced_threat"] else record["base_level"]
+        gesture_track_ids = record["gesture_track_ids"]
+        gestures = [
+            candidate
+            for candidate in record["gesture_candidates"]
+            if int(candidate["track_id"]) in gesture_track_ids
+        ]
+        detections = record["detections"] + gestures
+        if gestures:
+            gesture_frame_count += 1
+        if record["forced_threat"] and record["base_level"] != "threat":
+            threat_preroll_frame_count += 1
+        detection_count += len(detections)
+        held_detection_count += sum(bool(det.get("held")) for det in detections)
 
-    for frame_index, result in enumerate(results):
+        for detection in detections:
+            draw_box(
+                frame,
+                detection,
+                level_for_detection(detection, frame_level, gesture_track_ids),
+            )
+
+        status_level = frame_level
+        if status_level == "normal" and gesture_track_ids:
+            status_level = "minimal"
+        cv2.putText(
+            frame,
+            status_text_for(status_level),
+            (18, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        writer.write(frame)
+        frames.append(
+            {
+                "frame_index": record["frame_index"],
+                "event_threat_level": args.threat_level,
+                "rendered_threat_level": status_level,
+                "threat_preroll": record["forced_threat"] and record["base_level"] != "threat",
+                "gesture_active_track_ids": sorted(gesture_track_ids),
+                "detections": detections,
+            }
+        )
+
+    source_capture = cv2.VideoCapture(str(args.input))
+    frame_index = 0
+    while True:
+        ok, source_frame = source_capture.read()
+        if not ok:
+            break
+        frame = rotate_frame(source_frame, frame_rotation)
+        tracked = model.track(
+            source=frame,
+            persist=True,
+            tracker=args.tracker,
+            conf=args.conf,
+            imgsz=max(320, args.imgsz),
+            verbose=False,
+        )
+        if not tracked:
+            frame_index += 1
+            continue
+        result = tracked[0]
         frame = result.orig_img.copy()
         other_detections: list[dict[str, Any]] = []
         raw_person_detections: list[dict[str, Any]] = []
@@ -770,39 +1151,59 @@ def main() -> int:
                 else:
                     other_detections.append(det)
 
+        raw_person_detections = suppress_nested_people(raw_person_detections)
         person_detections = body_stabilizer.update(raw_person_detections, width, height)
         raw_face_detections = face_detector.detect(frame, person_detections)
         face_detections = face_stabilizer.update(raw_face_detections, person_detections, width, height)
         detections = other_detections + person_detections + face_detections
 
-        rendered_threat_level = threat_latch.update(detections)
-        for det in detections:
-            draw_box(frame, det, rendered_threat_level)
-
-        status_text = status_text_for(rendered_threat_level)
-        cv2.putText(
-            frame,
-            status_text,
-            (18, 32),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 0),
-            2,
-            cv2.LINE_AA,
+        raw_gesture_candidates = gesture_detector.detect(frame, person_detections)
+        gesture_candidates = gesture_box_stabilizer.update(
+            raw_gesture_candidates,
+            person_detections,
+            width,
+            height,
         )
-        writer.write(frame)
-        frames.append(
-            {
-                "frame_index": frame_index,
-                "event_threat_level": args.threat_level,
-                "rendered_threat_level": rendered_threat_level,
-                "detections": detections,
+        gesture_track_ids = gesture_latch.update(gesture_candidates)
+        base_level = threat_latch.update(detections)
+        record = {
+            "image": frame,
+            "frame_index": frame_index,
+            "base_level": base_level,
+            "forced_threat": False,
+            "gesture_track_ids": set(gesture_track_ids),
+            "gesture_candidates": gesture_candidates,
+            "detections": detections,
+        }
+        pending.append(record)
+
+        # Confirmation arrives on the second candidate frame. Backfill the first
+        # candidate while it is still in the short render buffer, so yellow starts
+        # with the visible gesture rather than one frame late.
+        for buffered in pending:
+            candidate_tracks = {
+                int(candidate["track_id"])
+                for candidate in buffered["gesture_candidates"]
             }
-        )
-        detection_count += len(detections)
-        held_detection_count += sum(bool(det.get("held")) for det in detections)
-        frame_count += 1
+            buffered["gesture_track_ids"].update(candidate_tracks & gesture_track_ids)
 
+        # This is an offline rendered video, so use a small bounded buffer to
+        # compensate for the generic COCO model recognizing a visible knife late.
+        # Only person/face color is backfilled; no fake object box is synthesized.
+        if any(det["kind"] in {"knife", "object"} for det in detections):
+            for buffered in pending:
+                buffered["forced_threat"] = True
+
+        if len(pending) > max(0, args.threat_preroll_frames):
+            render_record(pending.popleft())
+
+        frame_count += 1
+        frame_index += 1
+
+    source_capture.release()
+    gesture_detector.close()
+    while pending:
+        render_record(pending.popleft())
     writer.release()
 
     tracks = {
@@ -811,13 +1212,23 @@ def main() -> int:
         "model": args.model,
         "tracker": args.tracker,
         "event_threat_level": args.threat_level,
-        "render_policy": "temporally-stabilized-lock-v4",
+        "render_policy": "gesture-and-fast-threat-lock-v5",
+        "yolo_imgsz": args.imgsz,
         "threat_hold_frames": args.threat_hold_frames,
+        "threat_preroll_frames": args.threat_preroll_frames,
+        "threat_preroll_frame_count": threat_preroll_frame_count,
         "body_smoothing": args.body_smoothing,
         "face_smoothing": args.face_smoothing,
         "track_hold_frames": args.track_hold_frames,
+        "hand_detector_enabled": gesture_detector.enabled,
+        "gesture_confirm_frames": args.gesture_confirm_frames,
+        "gesture_hold_frames": args.gesture_hold_frames,
+        "gesture_frame_count": gesture_frame_count,
         "concerning_behavior": args.concerning_behavior,
         "fps": fps,
+        "frame_rotation": frame_rotation,
+        "input_width": input_width,
+        "input_height": input_height,
         "width": width,
         "height": height,
         "frame_count": frame_count,

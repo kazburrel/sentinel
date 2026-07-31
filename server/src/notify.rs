@@ -676,7 +676,10 @@ fn event_id_for_playable_video_path(path: &Path) -> Option<String> {
         .or_else(|| rest.strip_suffix("_locked_latched_threat.mp4"))
         .or_else(|| rest.strip_suffix("_locked_stable_normal.mp4"))
         .or_else(|| rest.strip_suffix("_locked_stable_minimal.mp4"))
-        .or_else(|| rest.strip_suffix("_locked_stable_threat.mp4"))?;
+        .or_else(|| rest.strip_suffix("_locked_stable_threat.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_reactive_normal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_reactive_minimal.mp4"))
+        .or_else(|| rest.strip_suffix("_locked_reactive_threat.mp4"))?;
     (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string())
 }
 
@@ -1604,17 +1607,17 @@ mod tests {
     }
 
     #[test]
-    fn resolves_event_id_from_stable_and_older_locked_videos() {
+    fn resolves_event_id_from_reactive_and_older_locked_videos() {
+        assert_eq!(
+            event_id_for_playable_video_path(Path::new("event_123_locked_reactive_threat.mp4")),
+            Some("123".to_string())
+        );
         assert_eq!(
             event_id_for_playable_video_path(Path::new("event_123_locked_stable_threat.mp4")),
             Some("123".to_string())
         );
         assert_eq!(
-            event_id_for_playable_video_path(Path::new("event_123_locked_latched_threat.mp4")),
-            Some("123".to_string())
-        );
-        assert_eq!(
-            event_id_for_playable_video_path(Path::new("event_not-numeric_locked_stable_normal.mp4")),
+            event_id_for_playable_video_path(Path::new("event_not-numeric_locked_reactive_normal.mp4")),
             None
         );
     }

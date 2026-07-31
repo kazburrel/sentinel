@@ -2032,9 +2032,8 @@ firmware is untouched.
   face/person boxes even before any concerning object appeared. `scripts/track_video.py`
   now computes a `rendered_threat_level` per frame: normal/white when no threat object
   is visible, red only on frames where YOLO detects a concerning object (`knife`,
-  `scissors`, `baseball bat`, etc.), and yellow remains the event-level fallback for
-  gesture-only/minimal-threat events because there is not yet a reliable local
-  frame-by-frame gesture detector. Tracker output filenames were bumped to
+  `scissors`, `baseball bat`, etc.), and yellow remained the event-level fallback for
+  gesture-only/minimal-threat events at that stage. Tracker output filenames were bumped to
   `*_locked_frame_<level>.mp4` / `*_tracks_frame_<level>.json` so old cached all-red
   locked videos are not reused. Re-generated `1784135006831`: 292/301 frames rendered
   normal/white, 9/301 rendered threat/red, with the first frame visually confirmed
@@ -2061,6 +2060,34 @@ firmware is untouched.
   and 199 live + 48 held face detections. Seven focused Python tests cover smoothing,
   short holds, ID replacement, body-relative face following, false-face filtering,
   and threat-latch independence.
+- **Frame-level gesture and faster visible-knife response added**: the tracker now
+  depends on MediaPipe Hands and classifies a raised middle finger from 21 hand
+  landmarks on every frame using orientation-independent joint angles. It explicitly
+  requires the middle finger extended and index/ring/pinky folded, so a peace sign is
+  not treated as an obscene gesture. Evidence must appear on two consecutive frames;
+  the first candidate is backfilled from the bounded render buffer, the matched
+  canonical person ID becomes yellow immediately, and yellow holds for 18 frames.
+  Red object threat always overrides yellow. The detector degrades to the existing
+  event-level AI context if MediaPipe is unavailable or fails. Clip orientation is
+  now chosen once from YuNet face confidence across sampled 0/90/180/270-degree
+  views, so older sideways recordings are rotated upright before YOLO, face, and hand
+  tracking. Nested duplicate person boxes are suppressed, and overlapping ByteTrack
+  replacement IDs are remapped to the existing canonical person ID so gesture state
+  and box smoothing survive an ID switch. For small concerning objects, YOLO inference
+  increased from its default 640 grid to 960. On real knife event `1784135006831`,
+  first object recognition moved from frame 167 to frame 146. Because the video is
+  rendered offline, an 18-frame bounded buffer recolors only person/face boxes before
+  that delayed recognition (never fabricating an object box), placing first red at
+  frame 128 -- where the knife first becomes visibly clear around frame 130. The same
+  mixed gesture+knife clip found the middle finger on frames 79-101, began yellow at
+  frame 79, switched to red for the visible knife episode, then decayed to yellow as
+  intended. Real gesture event `1783957936278` auto-rotated 270 degrees upright and
+  local gesture detection produced yellow on 64/82 frames even when the test
+  deliberately passed event threat level `normal`. New outputs are versioned as
+  `*_locked_reactive_<level>.mp4` / `*_tracks_reactive_<level>.json`; all prior cache
+  names remain parseable. Eleven Python tests cover box stabilization/identity bridging,
+  false-face and duplicate-person filtering, gesture geometry/debouncing/priority,
+  and threat latching.
 - **Clear-human Telegram alert photo added**: Telegram no longer has to use the first
   PIR trigger thumbnail or a fixed later keyframe. Added `scripts/select_alert_frame.py`,
   a lightweight YuNet face-selector sidecar that scans the extracted keyframes (with
